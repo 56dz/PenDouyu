@@ -153,7 +153,7 @@ export function probeLogicalVideoRect(videoWidth, videoHeight) {
 // 逻辑矩形 → 物理矩形（**真·旋转变换**，不是"面板内居中"近似）
 //
 // 由真机像素测量反推（详见 docs/x6pro-video-playback.md §2.1）：
-// 逻辑面上粉色 accent 的 bbox (10,0)-(932,170) 落在面板 (108,28)-(276,948)，
+// 逻辑面上高亮色块的 bbox (10,0)-(932,170) 落在面板 (108,28)-(276,948)，
 // 唯一自洽的映射是
 //     panel_x = PANEL_X_OFFSET + logical_y      （逻辑 y 沿面板 +x）
 //     panel_y = 960 − logical_x                 （逻辑 x 沿面板 −y，反向）

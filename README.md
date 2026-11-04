@@ -2,12 +2,14 @@
 
 把斗鱼直播装进有道词典笔。
 
-这是一款跑在有道词典笔上的直播客户端：斗鱼为主（推荐流 / 分类 / 搜索 / 多码率切换），B 站完整保留（推荐、热门、搜索、DASH 点播、评论、图文、扫码登录）。用有道自家的 Falcon 小程序框架（QuickJS + Vue 2 单文件组件）写成，屏幕只有 960×266 点，指甲盖大小。
+纯斗鱼直播客户端：推荐流 / 分类浏览 / 搜索 / 多码率切换 / 硬解直出。用有道自家的 Falcon 小程序框架（QuickJS + Vue 2 单文件组件）写成，屏幕只有 960×266 点，指甲盖大小。
 
-当前版本 `1.0.0`，只支持 **X6 Pro**（RK3562 / aarch64）。
+当前版本 `2.0.0`，只支持 **X6 Pro**（RK3562 / aarch64）。
 
-![version](https://img.shields.io/badge/version-1.0.0-orange)
+![version](https://img.shields.io/badge/version-2.0.0-orange)
 ![license](https://img.shields.io/badge/license-GPL--3.0-green)
+
+> **v2.0.0 是一次减法**：1.0.0 是把斗鱼叠加在 [PenBili](https://github.com/56dz/PenBili)（B 站客户端）之上，一个 App 里塞两个站。2.0.0 把 B 站整套代码删干净了 —— 界面里的站点切换、推荐/热门/搜索 tabs、DASH 点播、评论区、图文详情、扫码登录、自检页全部移除，`src/services/bili/` 整目录、`feed.js`、`history.js`、`imgurl.js` 不再存在。换来的是把整个应用从 4248 行压到 1448 行、从三个 native 模块压到两个。
 
 ---
 
@@ -32,7 +34,9 @@
 
 全部为 X6 Pro 真机采集，960×266。
 
-**斗鱼推荐流** —— 左栏顶部是「斗鱼 / B站」站点切换，下面是一级分类
+> **这一组图是 v1.0.0 拍的**，所以左栏顶部还能看到「斗鱼 / B站」两格站点切换 —— v2.0.0 已经把它连同 B 站整个删掉。功能结构（一级分类 / 二级 chip / 搜索行 / 四档码率）与 v2.0.0 完全一致，只是少了那两格。等词典笔回到手上会重拍一轮替换。
+
+**斗鱼推荐流** —— 左栏一级分类，内容区 5 列网格
 
 ![推荐流](docs/screenshots/x6-home.png)
 
@@ -48,10 +52,6 @@
 
 ![播放页](docs/screenshots/x6-play.png)
 
-**B 站** —— 逻辑完全保留，切过去就是 PenBili
-
-![B站](docs/screenshots/x6-bili.png)
-
 > 除播放页外，其余截图都是 `miniapp_cli capture` 原样抓的 Falcon 画布层。视频走 DRM/KMS
 > 硬件平面直出，不在画布里，所以画布截图里视频区是黑的——不是 bug。播放页那张是用
 > `kmssrc` 单独抓了硬件平面帧，再按 `/sys/kernel/debug/dri/0/summary` 里 `Esmart1-win0`
@@ -64,13 +64,12 @@
 
 ## 功能
 
-### 斗鱼（`site=douyu`，默认首页）
-
 **浏览**
 
 - 一级分类 5 组 + 推荐：网游竞技 / 单机热游 / 手游休闲 / 娱乐 / 正能量，来自 `getLeftNav`
 - 二级分类横排 chip（最多 18 个），选中后拉该分区房间，5 列网格、按整行裁剪不留半行
 - 卡片：封面 166×93 + 下方一条 12px「直播中」橙标 + 热度 + 标题 + 主播
+- 列表可无限下拉（每页 120 条），底部留「刷新 / 加载更多」两格
 
 **播放**
 
@@ -79,7 +78,7 @@
 - 高亮跟的是**服务端实际返回的 rate**，不是请求值 —— 斗鱼会就近取档，拿请求参数当结果会骗人
 - 直链 `expire=300`，页面轮询在拿到后 **210 秒**主动换链（重新签名；改 URL 后缀会 403）
 - 断流自愈：native 连续 6 秒无帧或收到 EOS → 重建管线重连（最多 5 次，退避 2/4/6/8 秒），配额用完上报错误码 `17` 给 JS 触发换链
-- 直播无 seek，进度条位置改显示「已播时长」
+- 直播无 seek，左列信息卡显示「已播时长」
 
 **搜索**
 
@@ -88,12 +87,6 @@
 - `searchShow` 接口有 IP 级风控（`error=1/8`），不可用，所以只能走上面这条兜底链路
 - 搜索结果没有翻页（一次拉 120 条后按整行裁剪），底部右侧老实显示「没有更多了」而不是放个假按钮
 - 搜索态下二级分类 chip 自动隐藏，左栏一级分类仍可见；点它会先退出搜索再切分类
-
-### B 站（`site=bili`）
-
-- 推荐流 / 热门 / 搜索（视频·图文·直播三栏）/ 我的，行为与 PenBili 完全一致
-- DASH 点播、画质七档、播放历史（最近 10 条）、点赞投币收藏、评论区、图文详情
-- TV 协议扫码登录，二维码纯 CSS 渲染（零 inline style）
 
 ---
 
@@ -196,36 +189,40 @@ PenBili 那边是用**交替 A/B**（同一时段两种配置轮流跑，消除�
 
 ```
 src/
-  pages/index/index.vue   单页应用：斗鱼浏览/播放 + B 站四个 tab + 图文（约 4250 行）
-  pages/diag/diag.vue     自检页（主界面没有入口，靠 adb 启动）
+  pages/index/index.vue   单页应用：浏览 / 播放（约 1448 行）
   services/
     douyu/api.js          签名取流：did / getEncryption / auth / getH5PlayV1 / 错误语义
     douyu/cate.js         分类树 getLeftNav + 关键词→分类映射 getSearchRec
     douyu/feed.js         分区房间列表 mixList + searchLive 兜底过滤
     douyu/normalize.js    字段归一（封面/头像 CDN 拼接、热度格式化）
-    play_session.js       会话编排：解析流地址 → open → 轮询 → 换链 / seek / recover / close
+    play_session.js       会话编排：解析流地址 → open → 轮询 → 换链 / recover / close
     player.js             native player 模块封装（16 参数 open 契约）
-    screen.js             屏幕几何纯函数 + 保活 + 进度条几何
-    input.js              系统输入法（发评论、搜关键词）
+    screen.js             屏幕几何纯函数 + 保活
+    input.js              系统输入法（搜关键词）
+    net.js                网络 adapter（只留 httpGet 一条 GET 链路）
+    md5.js                斗鱼签名用的 md5（纯 JS，QuickJS 无 crypto）
     storage.js            持久化（内存镜像 + 串行写 + 回读校验）
-    bili/                 B 站接口层：client / wbi / playurl / live / article / reply / action / qrlogin
-  styles/base.less        全站样式（斗鱼新增类在 1357 行起的「斗鱼（PenDouyu 新增）」段，搜索行类在 1623 行起）
+    video_settings.js     档位偏好（480p30 / 720p30 / 720p60）
+    autotest_seed.js      自检种子的双开关守卫
+    live_end_probe.js     直播下播判据的引擎级自证
+  styles/base.less        全站样式（623 行）
   styles/var.less         主题变量（@accent = #FF5D23 斗鱼橙）
-native/csrc/              交叉编译的 JSAPI 原生模块（20 个 .c/.h，约 14.2k 行）
-test/run.js               纯逻辑单测（204 条）
+native/csrc/              交叉编译的 JSAPI 原生模块（约 13.5k 行）
+test/run.js               纯逻辑单测（86 条）
 test/douyu_feed_test.js   斗鱼服务层联网冒烟（宿主机 node 跑，只发 GET）
 tools/                    图标生成 / 截图合成 / 部署 / ELF 校验
 ```
 
-页面只有两个（`index` 和 `diag`）。单页应用的理由是 falcon 页面切换开销大，浏览/播放/图文全用 `mode` 状态机在一个页面内切换；斗鱼和 B 站则用 `site` 状态切数据源，两侧列表各自缓存，切回来不重拉。
+页面只有一个（`index`）。单页应用的理由是 falcon 页面切换开销大，浏览 / 播放全用 `mode` 状态机在一个页面内切换。
 
-native 侧三个模块：
+native 侧两个模块：
 
 | 模块 | 职责 |
 | --- | --- |
 | `libjsapi_player2.so` | **主实现**。进程内 GStreamer，worker 线程独占所有 Gst 对象——JS 线程碰不到任何 Gst 调用，所以不需要锁，也不可能阻塞 JS 线程 |
 | `libjsapi_player.so` | 旧实现（fb0 贴帧 + aplay），性能差，仅作回退 |
-| `libjsapi_httpjson.so` | 原始 POST body + 二进制 GET。运行时的 `$falcon.jsapi.http` 会对 data 做二次 JSON 序列化且无法关闭，导致部分服务端返回 422 |
+
+> v1.0.0 还有第三个 `libjsapi_httpjson.so`（原始 POST body + 二进制 GET），它是为 B 站 TV 登录接口和弹幕 protobuf 造的。斗鱼所有接口都是普通 GET，`$falcon.jsapi.http` 够用，所以 v2.0.0 把它连同 `native/csrc/httpjson.c` 一起删了。
 
 错误码（`core/queue.h:132-154`）：
 
@@ -241,7 +238,7 @@ native 侧三个模块：
 | 7 | OPEN_FAILED | 16 | BRANCH_LINK |
 | 8 | NO_STREAM | **17** | **LIVE_RECONNECT** |
 
-17 号不在 `queue.h` 里，只定义在 `session.c:256` —— 它是会话级语义（「重连配额用完了，请换个新 URL」），不是单次管线操作的错误，所以故意没有放进那个枚举。JS 侧 `play_session.js:221` 的 `LIVE_RECONNECT_ERR = 17` 与它对得上。
+17 号不在 `queue.h` 里，只定义在 `session.c:256` —— 它是会话级语义（「重连配额用完了，请换个新 URL」），不是单次管线操作的错误，所以故意没有放进那个枚举。JS 侧 `play_session.js` 的 `LIVE_RECONNECT_ERR = 17` 与它对得上。
 
 ---
 
@@ -263,10 +260,10 @@ native 侧三个模块：
 cd PenDouyu
 npm ci
 
-# 交叉编译 native（产出三个 .so 到 libs/，需要 Zig）
+# 交叉编译 native（产出两个 .so 到 libs/，需要 Zig）
 npm run native
 
-# 打 AMR 包（产出 8002026110200002.1_0_0.amr，约 296 KB）
+# 打 AMR 包（产出 8002026110200002.2_0_0.amr，约 195 KB）
 npm run build
 
 # 单测
@@ -275,27 +272,27 @@ npm test
 # 斗鱼服务层联网冒烟（宿主机跑，只发 GET，不写任何远端状态）
 node test/douyu_feed_test.js
 
-# 重做图标（从 .tmp_douyu_icon.png 放大 + 锐化）
+# 重做图标（桌面图标 + 界面 logo，都从 .tmp_douyu_icon.png 生成）
 npm run icon
 ```
 
-`npm run native` 内部是 `powershell -File native/build.ps1`，target 固定 `aarch64-linux-gnu.2.17`。X6 Pro 是 **aarch64 64 位**，装 32 位库会在 `dynamic_load_jsapi` 处直接报 `wrong ELF class: ELFCLASS32`。脚本末尾会自动跑 `python tools/inspect_elf.py <so> --target aarch64` 校验 ELFCLASS64 / machine 183（三份 `.so` 都必须过）。
+`npm run native` 内部是 `powershell -File native/build.ps1`，target 固定 `aarch64-linux-gnu.2.17`。X6 Pro 是 **aarch64 64 位**，装 32 位库会在 `dynamic_load_jsapi` 处直接报 `wrong ELF class: ELFCLASS32`。脚本末尾会自动跑 `python tools/inspect_elf.py <so> --target aarch64` 校验 ELFCLASS64 / machine 183（两份 `.so` 都必须过）。
 
 打包时出现下面这条告警是**正常的**：
 
 ```
-未找到以下模块,可能会导致应用运行时异常(如模块为原生模块请忽略): global,brightness,httpjson
+未找到以下模块,可能会导致应用运行时异常(如模块为原生模块请忽略): brightness,global
 ```
 
-这三个是原生模块，由 `libs/` 里的 `.so` 提供，不是 JS 依赖。
+这两个是设备原生模块，由系统或 `libs/` 里的 `.so` 提供，不是 JS 依赖。
 
 `找不到 theme "theme-dark"` 也是既有告警（`app.json` 里声明的主题在打包器侧没有对应表），不影响运行。
 
 ## 安装
 
 ```bash
-adb push 8002026110200002.1_0_0.amr /tmp/
-adb shell "miniapp_cli install /tmp/8002026110200002.1_0_0.amr"   # 必须返回 "ret":0
+adb push 8002026110200002.2_0_0.amr /tmp/
+adb shell "miniapp_cli install /tmp/8002026110200002.2_0_0.amr"   # 必须返回 "ret":0
 
 # 冷启动：先切桌面再起目标页，保证重建页面实例
 adb shell "miniapp_cli start 8080222437664451"
@@ -310,19 +307,13 @@ adb shell "miniapp_cli start 8002026110200002 index"
 - 每次 install 会在 `a`/`b` 两个 slot 之间轮换，旧目录被删
 - Git Bash 下 `adb push` 到设备 `/tmp` 必须 `MSYS_NO_PATHCONV=1`，否则 `/tmp` 会被改写成 Windows 临时目录
 
-自检页只能这样进（主界面没有入口）：
-
-```bash
-adb shell "miniapp_cli start 8002026110200002 diag"
-```
-
 ---
 
 ## 调试
 
-**日志。** 应用日志在 `/userdata/applog/`，`YD_PEN_APP.log` 含二进制字节，**必须 `grep -a`**。native 播放日志在 `/tmp/pb2.log`，用 `touch /tmp/pb2.enable` 或设 `PENBILI_PB2_LOG=1` 打开，格式 `[<秒>.<毫秒>] <msg>`。
+**日志。** 应用日志在 `/userdata/applog/`，`YD_PEN_APP.log` 含二进制字节，**必须 `grep -a`**。native 播放日志在 `/tmp/pb2.log`，用 `touch /tmp/pb2.enable` 或设 `PENDOUYU_PB2_LOG=1` 打开，格式 `[<秒>.<毫秒>] <msg>`。
 
-**curl 的实际参数**会完整 dump 到 `/tmp/pb2/argv-curl.txt`。排查「Referer/UA 是不是串了站」全靠这个文件 —— 本项目真出过一次：斗鱼直播带着 B 站 Referer 去拉 CDN，根因是页面组装播放上下文时把 UA/Referer 写死成了 B 站的，现在按 `session.site` 分流。
+**curl 的实际参数**会完整 dump 到 `/tmp/pb2/argv-curl.txt`。排查「Referer/UA 是不是串了站」全靠这个文件 —— 1.0.0 真出过一次：斗鱼直播带着 B 站 Referer 去拉 CDN，根因是页面组装播放上下文时把 UA/Referer 写死成了 B 站的。2.0.0 里 `makeCtx()` 只剩 `DOUYU_UA` / `DOUYU_REFERER` 一对常量，这类串站不可能再发生。
 
 **验证视频是否真的上屏，不能用 `miniapp_cli capture`** —— 它抓的是 Falcon 画布，看不到硬件视频平面：
 
@@ -361,29 +352,29 @@ gst-launch-1.0 kmssrc plane-id=76 num-buffers=1 ! videoconvert ! pngenc ! filesi
 ## 已知限制
 
 - **只支持 X6 Pro**（aarch64）。X5 的 32 位分支在 [PenBili-CVI](https://github.com/56dz/PenBili-CVI)，本仓库不带
+- **只有斗鱼，没有 B 站**。这是 v2.0.0 的明确取舍（见开头说明）—— 整个应用里已不存在
+  任何 B 站接口、页面、图标或 native 模块，想要 B 站请用 [PenBili](https://github.com/56dz/PenBili)
 - **无弹幕**。斗鱼弹幕是 WebSocket 二进制帧（`<u32 len><u32 len><i16 689><u8 0><u8 0><payload><0x00>`，STT 序列化），QuickJS 侧没有 websocket 能力
-- **直播无 seek**。直播态进度条位置换成「已播时长」文字
-- **斗鱼不进播放历史**。斗鱼房间没有 `bvid`，存下来就是死链
+- **直播无 seek**。直播态左列信息卡里显示「已播时长」
+- **无播放历史**。斗鱼房间没有稳定 ID 之外的可寻址信息，存下来容易变死链
 - **播放页右列空着**。相关推荐没做，`.pright-fill` 是不透明兜底占位（防止底下的浏览内容透出来）
-- **图标仍是 B 站粉色系**。13 个 png 图标沿用 PenBili 的素材，主题色已经在 `var.less` 统一成斗鱼橙；只有应用图标（`app_icon.png`）是重新生成的斗鱼橙色鲨鱼
 - **卡片角标不压图**。「直播中」标是封面下方一条 12px 横条，不是压在封面左上角 —— Falcon 的 `position:absolute` 不可靠，压歪比不压更难看
 - **斗鱼搜索不保证精确**。「关键词 → 分类 → 本地过滤」，分类映射不上时会退化成「该分类全部房间」
 - **直播延迟约 4 秒**。视频队列深度就是延迟下限（`PB2_LIVE_VIDEO_QUEUE_NS = 4s`）
 - 起播比"直接开播"慢 0.7~2.4 秒，这是缓冲门的代价（换来起播即满帧，不从第 3 秒开始）
-- 蓝牙音量镜像的逻辑完整复用自 PenBili，但本机测试期间设备无蓝牙连接，**AVRCP 写入路径无法在真机上验证**
+- 蓝牙音量镜像的逻辑完整复用自 PenBili，但测试期间设备无蓝牙连接，**AVRCP 写入路径无法在真机上验证**
 
 ---
 
 ## 致谢
 
-- [PenBili](https://github.com/56dz/PenBili)：整个项目的基础。B 站链路、native 播放器、屏幕几何、蓝牙音量镜像全部来自那里
+- [PenBili](https://github.com/56dz/PenBili)：整个项目的基础。native 播放器、屏幕几何、蓝牙音量镜像全部来自那里（v2.0.0 起只保留其中的平台层与直播链路）
 - [56dz/douyu-api](https://github.com/56dz/douyu-api)：斗鱼签名流程的参考实现，`getEncryption` / `getH5PlayV1` 的参数就是照着它对的
-- [SocialSisterYi/bilibili-API-collect](https://github.com/SocialSisterYi/bilibili-API-collect)：B 站接口文档
 - 有道 Falcon 小程序的官方示例与 `falcon-ui` 组件库：布局、样式和触摸事件行为都以它为准
 
 ## 免责声明
 
-- 本项目为个人学习用途，与斗鱼、哔哩哔哩、有道（网易）均无关联；相关商标归其权利人所有
+- 本项目为个人学习用途，与斗鱼、有道（网易）均无关联；相关商标归其权利人所有
 - `native/iot-miniapp-sdk/include` 为有道小程序官方 SDK 头文件，仅作为 native 模块的编译依赖随仓库分发；版权归原权利人，不适用于本仓库 GPL-3.0 授权
 - 使用本软件访问服务时请遵守相应平台的用户协议；账号安全责任自负
 - **无任何担保**；详见 LICENSE

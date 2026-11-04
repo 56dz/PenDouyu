@@ -31,8 +31,8 @@
  *   - 本地文件：seek_simple 后用 position 落到 clamped-1500 ~ clamped+3000 判定，
  *     并顺带 poll bus 捕获 ERROR。
  */
-#ifndef PENBILI_PB2_SESSION_H
-#define PENBILI_PB2_SESSION_H
+#ifndef PENDOUYU_PB2_SESSION_H
+#define PENDOUYU_PB2_SESSION_H
 
 #include "core/queue.h"
 
@@ -119,4 +119,4 @@ unsigned long long pb2_session_frames(void);
  */
 long long pb2_session_stall_ms(void);
 
-#endif /* PENBILI_PB2_SESSION_H */
+#endif /* PENDOUYU_PB2_SESSION_H */

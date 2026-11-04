@@ -4,8 +4,8 @@
  * 这些操作会 fork/exec、会阻塞几十毫秒到几百毫秒，**绝对不能在 JSAPI 线程调用**。
  * 统一放在这里，谁调用谁负责保证自己不在 JS 线程上。
  */
-#ifndef PENBILI_PB2_CMD_H
-#define PENBILI_PB2_CMD_H
+#ifndef PENDOUYU_PB2_CMD_H
+#define PENDOUYU_PB2_CMD_H
 
 /*
  * 跑一条 shell 命令并等待结束，捕获 stdout 到 out（可为 NULL）。
@@ -155,4 +155,4 @@ int pb2_mp3_marker_clear(void);
  */
 long pb2_rss_kb(void);
 
-#endif /* PENBILI_PB2_CMD_H */
+#endif /* PENDOUYU_PB2_CMD_H */

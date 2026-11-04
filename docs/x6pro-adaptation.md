@@ -3,7 +3,7 @@
 > **来源说明**：本文随 PenDouyu 从 [PenBili](https://github.com/56dz/PenBili) 继承而来。
 > 它记录的是**平台层事实**（屏幕几何、触控坐标映射、Falcon 运行时的坑），与上层跑的是
 > B 站还是斗鱼无关，所以原样保留、没有改写。文中出现的 `PenBili`、`191 passed`
-> 属于历史记录；PenDouyu 对应的命令是 `cd PenDouyu && node test/run.js`（204 条）。
+> 属于历史记录；PenDouyu 对应的命令是 `cd PenDouyu && node test/run.js`（v2.0.0 剥离 B 站后为 86 条）。
 
 > **阅读提示（v3.5.2 起）**：当前界面是「左列 213 / 中列 469 / 右列 278」的三列播放布局，
 > 本文 §1 末尾的「栏位骨架」与 §4 的截图清单停留在 v3.0.0 的「64 / 432 / 448」旧布局，
@@ -103,10 +103,14 @@ flex-basis: 0px;
 http://archive.biliimg.com/bfs/archive/<hash>.jpg   → 200
 ```
 
-所以新增 `src/services/imgurl.js` 的 `normalizeImageUrl()`，把任意 `*.hdslb.com` 重写到
+所以当时新增了 `src/services/imgurl.js` 的 `normalizeImageUrl()`，把任意 `*.hdslb.com` 重写到
 `http://archive.biliimg.com` 并保留 path/query；`feed.js`、`bili/article.js`、`history.js`
 都走它。**注意：旧版本已写进设备存储的播放历史里是裸 hdslb 地址，`normalizeHistory()` 也要过一遍**，
 否则历史封面还是灰块。
+
+> v2.0.0 备注：`imgurl.js`、`feed.js`、`bili/article.js`、`history.js` 全部随 B 站一起删除了，
+> 这一节现在只有历史价值。斗鱼图床归一是 `src/services/douyu/normalize.js` 里的
+> `normalizeImageUrl()`（`rpic.douyucdn.cn` / `apic.douyucdn.cn`），逻辑同源、主机名不同。
 
 ### 3.3 native 模块必须是 aarch64
 

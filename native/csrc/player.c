@@ -197,10 +197,10 @@ static void raise_audio_thread_prio(void); /* 定义在 RING 水位区（feeder 
 #define KMS_ID_STR "76"
 /* v3.4.0：面板实际刷新率（`modetest -c` 报 #0 480x960 **59.88**，30000/1001 类时序）。
  * 用 1497/25 精确表达 59.88，别写 60/1 —— 差 0.2% 会在长跑里周期性多出一帧。 */
-#define PENBILI_PANEL_RATE "1497/25"
+#define PENDOUYU_PANEL_RATE "1497/25"
 /* v3.5.2：迟到帧阈值（毫秒）—— 超过它才判「迟到」并丢弃（配合 kmssink qos=true）。
  * 必须定义在这里：render_start()（第 ~800 行）要用，而原先放在 2196 行是错的。 */
-#define PENBILI_MAX_LATENESS_MS 40
+#define PENDOUYU_MAX_LATENESS_MS 40
 #define GST_LAUNCH_PATH "/usr/bin/gst-launch-1.0"
 #define KMS_FIFO_PATH "/tmp/vp_vid.fifo"
 #define FFMPEG_PATH "/usr/bin/ffmpeg"
@@ -381,7 +381,7 @@ struct render_info {
     int fps;      /* 保留（诊断用；v3.0.0 起不再进 caps） */
     int transpose;/* 1=顺时针 90° / 2=逆时针 90°（ffmpeg 语义）→ 映射到 mppvideodec rotation */
     int fps_cap;  /* v3.2.0：渲染帧率上限（0 = 不限）；>0 时在解码器后插 videorate max-rate */
-    int dump_fd;  /* 诊断用：PENBILI_DUMP_FIFO 落盘 fd，-1 = 未启用 */
+    int dump_fd;  /* 诊断用：PENDOUYU_DUMP_FIFO 落盘 fd，-1 = 未启用 */
     char path[64];
 };
 
@@ -531,7 +531,7 @@ static int fifo_write_all(int fd, const unsigned char *buf, size_t n, const vola
  *   · 旋转由解码器做（mppvideodec rotation），不再走 ffmpeg transpose 滤镜；
  *   · 缩放交给 KMS/RGA（kmssink render-rectangle 的硬件缩放），不再走 ffmpeg scale；
  *   · 因此**不需要 videoconvert**：mppvideodec 输出 NV12，kmssink 直接吃。
- *     若某些固件上 NV12 上屏颜色/尺寸不对，设环境变量 PENBILI_GST_CONVERT=1 插一层
+ *     若某些固件上 NV12 上屏颜色/尺寸不对，设环境变量 PENDOUYU_GST_CONVERT=1 插一层
  *     videoconvert 即可（免重编排查用）。
  * rotation 映射：s->transpose 是 ffmpeg 语义（1=顺时针 90°，2=逆时针 90°，3=180°），
  *   mppvideodec rotation 是**顺时针角度**（0/90/180/270）。
@@ -610,7 +610,7 @@ static int render_start(int x, int y, int w, int h) {
      * 排查开关：/tmp/vp_filesrc.on → 退回 filesrc（老行为），便于对照。 */
     snprintf(rotation, sizeof(rotation), "rotation=%d", rot);
     snprintf(rect, sizeof(rect), "render-rectangle=<%d,%d,%d,%d>", px, y, w, h);
-    if (getenv("PENBILI_GST_CONVERT")) extra = "videoconvert";
+    if (getenv("PENDOUYU_GST_CONVERT")) extra = "videoconvert";
     use_fdsrc = (access("/tmp/vp_filesrc.on", F_OK) != 0);
 
     pid = fork();
@@ -633,10 +633,10 @@ static int render_start(int x, int y, int w, int h) {
             dup2(logfd, 1);
             close(logfd);
         }
-        /* 排查开关：PENBILI_GST_DEBUG=<GST_DEBUG 值> 给子进程设 GST_DEBUG。
+        /* 排查开关：PENDOUYU_GST_DEBUG=<GST_DEBUG 值> 给子进程设 GST_DEBUG。
          * 真机遇到「gst 自己 exit=0（EOS）而写端仍开着」时，靠它看清是哪一级报的 EOS。 */
         {
-            const char *gdbg = getenv("PENBILI_GST_DEBUG");
+            const char *gdbg = getenv("PENDOUYU_GST_DEBUG");
             setenv("GST_DEBUG", (gdbg && gdbg[0]) ? gdbg : "*:3", 1);
             setenv("GST_DEBUG_NO_COLOR", "1", 1);
         }
@@ -661,9 +661,9 @@ static int render_start(int x, int y, int w, int h) {
             }
         }
         argv[i++] = (char *)GST_LAUNCH_PATH;
-        /* PENBILI_GST_NOQ=1 → 去掉 -q，把 EOS/协商等全量消息打进日志（排查专用）。 */
-        /* 排查期：默认不加 -q（看到 EOS/协商消息）；设 PENBILI_GST_QUIET=1 恢复安静模式。 */
-        if (getenv("PENBILI_GST_QUIET")) argv[i++] = (char *)"-q";
+        /* PENDOUYU_GST_NOQ=1 → 去掉 -q，把 EOS/协商等全量消息打进日志（排查专用）。 */
+        /* 排查期：默认不加 -q（看到 EOS/协商消息）；设 PENDOUYU_GST_QUIET=1 恢复安静模式。 */
+        if (getenv("PENDOUYU_GST_QUIET")) argv[i++] = (char *)"-q";
         /* fpsdisplaysink 的 `rendered: N, dropped: M` 是 **element 的 last-message**，
          * 只有 `-v` 才会被 gst-launch 打到日志；不加 -v 它一行都不输出（实测踩过）。
          * 该开关只在取证期打开，正常播放不加，避免日志膨胀。 */
@@ -735,7 +735,7 @@ static int render_start(int x, int y, int w, int h) {
              *   video/x-raw framerate=1497/25
              * 而 caps 语法要求逗号分隔 → 报 `could not parse caps`，整条管线
              * 直接不建（真机踩过：日志里 `erroneous pipeline`，画面还是旧帧）。 */
-            argv[i++] = (char *)"video/x-raw,framerate=" PENBILI_PANEL_RATE;
+            argv[i++] = (char *)"video/x-raw,framerate=" PENDOUYU_PANEL_RATE;
             argv[i++] = (char *)"!";
         }
         if (extra) {
@@ -801,7 +801,7 @@ static int render_start(int x, int y, int w, int h) {
             int no_late = access("/tmp/vp_nolate.on", F_OK) == 0;
             char late[32], qos[24];
             snprintf(late, sizeof(late), "max-lateness=%d",
-                    no_late ? -1 : PENBILI_MAX_LATENESS_MS);
+                    no_late ? -1 : PENDOUYU_MAX_LATENESS_MS);
             snprintf(qos, sizeof(qos), "qos=%s", no_late ? "false" : "true");
             snprintf(sync, sizeof(sync), "sync=%s",
                     access("/tmp/vp_nosync.on", F_OK) == 0 ? "false" : "true");
@@ -941,7 +941,7 @@ static int render_start(int x, int y, int w, int h) {
 /* 统一入口：有 fbdev 走 memcpy，没 fbdev 走 KMS overlay */
 static int fb_open(void) {
     if (g_fb.map) return 0;
-#ifndef PENBILI_KMS_ONLY /* -DPENBILI_KMS_ONLY：X6 Pro 无 /dev/fb0，构建期直接跳过 fbdev 探测 */
+#ifndef PENDOUYU_KMS_ONLY /* -DPENDOUYU_KMS_ONLY：X6 Pro 无 /dev/fb0，构建期直接跳过 fbdev 探测 */
     if (fbdev_open() == 0) return 0;
 #endif
     /* X6 Pro 分支：没有 /dev/fb0，改为 KMS，首帧时按实际矩形建链 */
@@ -1030,7 +1030,7 @@ static int fb_write_stream(const unsigned char *data, size_t n, int x, int y, in
                     g_rd.gst_pid = 0;
                 }
             }
-            /* 诊断：PENBILI_DUMP_FIFO=<path> 把真正写进 FIFO 的压缩字节原样落盘，
+            /* 诊断：PENDOUYU_DUMP_FIFO=<path> 把真正写进 FIFO 的压缩字节原样落盘，
              * 用于「播放器里 gst 秒退、手动喂同样 gst 却正常」时做字节级回放比对。 */
             if (g_rd.dump_fd < 0) g_rd.dump_fd = open("/tmp/dump.h264", O_WRONLY | O_CREAT | O_APPEND, 0644);
             if (g_rd.dump_fd >= 0 && n > 0) {
@@ -1359,7 +1359,7 @@ static void ensure_pipe_max_raised(void) {
 /* ---- v3.0.0：ffmpeg stderr 泵 ----
  * 为什么需要：copy 模式下有两件事**只能从 ffmpeg 日志里拿到**，而且都不能等进程结束：
  *   ① **真实帧率**：`-c:v copy` 没有 `-r` 重采样，输出帧率 = 源帧率。JS 侧恒传 24
- *      （src/services/bili/playurl.js 的 HTML5_FPS），但 B 站 DASH/直播多为 30fps →
+ *      （原 B 站 playurl.js 的 HTML5_FPS，该文件 v2.0.0 已删），但多数源是 30fps →
  *      节拍按 24 算会慢 25%，漂移一路涨到强制重同步（每 12s 跳一次画面）。
  *      从 `Stream #0:0: Video: ... 30 fps,` 解析出真值覆盖 s->fps。
  *   ② **seek 落点**：`-ss` + copy 只能落在**前一个关键帧**（实测 -ss 10.5 → 首包 pts 10.0），
@@ -2197,10 +2197,10 @@ static int spawn_aplay(struct session *s, const char *device) {
  * 见 AV_SKIP_MS 注释），死区必须大于它，否则会一直触发修正。 */
 /* v3.5.0：相位死区（毫秒）。当前**没有**相位对齐逻辑（见 video_thread 里的说明），
  * 保留常量只为记录「多大的偏差算可忽略」这一结论。 */
-#define PENBILI_PHASE_DEADBAND_MS 120
+#define PENDOUYU_PHASE_DEADBAND_MS 120
 /* v3.5.1 起播定格门上限（毫秒）：首帧上屏后音频迟迟不开写时，最多定格这么久就放行，
  * 避免音频链异常时画面永久冻结。 */
-#define PENBILI_HOLD_MAX_MS 4000
+#define PENDOUYU_HOLD_MAX_MS 4000
 /* v2.9.3：墙钟节拍下落后时的**最大追赶倍率**（1.25 = 略快一点追上，不出现"突然快放"） */
 #define PACE_CATCHUP_MAX 1.25
 #define AV_WAIT_CAP_MS 200 /* durl 单进程模式每帧等待上限（video pipe 满互锁死锁的解扣） */
@@ -2506,7 +2506,7 @@ static void *video_thread(void *arg) {
         if (s->frames >= 6 && s->seek_skip_frames <= 0 &&
             s->audio_enabled && s->audio_alive && s->audio_input[0] &&
             s->writer_bytes <= 0 && access("/tmp/vp_nohold.on", F_OK) != 0) {
-            if ((now_seconds() - s->last_blit_at) * 1000.0 < (double)PENBILI_HOLD_MAX_MS) {
+            if ((now_seconds() - s->last_blit_at) * 1000.0 < (double)PENDOUYU_HOLD_MAX_MS) {
                 usleep(5000);
                 continue; /* 不读新帧 → FIFO 不写 → 画面停在首帧 */
             }
@@ -3007,7 +3007,7 @@ static void *video_thread(void *arg) {
         /* 每秒落一行节奏诊断（上限 300 行）。默认关闭 —— 排查「上屏卡顿」时再打开，
          * 免得日常播放每秒一次 open/write/close。
          * 开关用**文件存在性**而不是环境变量：`miniapp_cli start` 不会把 adb shell 里
-         * export 的变量传给被启动的 miniapp 进程（实测 PENBILI_VID_DIAG=1 完全无效，
+         * export 的变量传给被启动的 miniapp 进程（实测 PENDOUYU_VID_DIAG=1 完全无效，
          * /tmp/vp_vid.log 一直是空文件），而 `touch /tmp/vp_diag.on` 随时生效。 */
         if (d_lines < 300 && now_seconds() - d_t0 >= 1.0) {
             int dfd = (access("/tmp/vp_diag.on", F_OK) == 0) ? open("/tmp/vp_vid.log", O_WRONLY | O_CREAT | O_APPEND, 0644) : -1;

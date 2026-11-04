@@ -24,8 +24,8 @@
  *      seqlock，因为流线程不是 worker，不能进 seqlock 的写者角色。
  *      status() 直接原子读这几个值，最多差一帧，对 UI 无影响。
  */
-#ifndef PENBILI_PB2_QUEUE_H
-#define PENBILI_PB2_QUEUE_H
+#ifndef PENDOUYU_PB2_QUEUE_H
+#define PENDOUYU_PB2_QUEUE_H
 
 #include <pthread.h>
 #include <stdatomic.h>
@@ -229,4 +229,4 @@ long long pb2_probe_last_frame_ms(pb2_probe_t *p);
 unsigned long long pb2_probe_abytes(pb2_probe_t *p);
 void pb2_probe_reset(pb2_probe_t *p);
 
-#endif /* PENBILI_PB2_QUEUE_H */
+#endif /* PENDOUYU_PB2_QUEUE_H */

@@ -2,7 +2,7 @@
 //
 // 为什么有两套（docs/design/playback-rewrite-adr.md §3 阶段 1）：
 //   旧 player.c 完全不动，新模块以 JSAPI 名 `player2` 并行存在；JS 层用开关选择，
-//   真机出问题可一行配置回退。开关来源：storage `bili_player_impl`（'v1'/'v2'），
+//   真机出问题可一行配置回退。开关来源：storage `douyu_player_impl`（'v1'/'v2'），
 //   缺省 = 'v2'。开关值由页面 created() 调 loadPlayerImpl() 预读并缓存，
 //   因此**播放热路径上不做任何 storage 读取**（读盘最坏 5s，绝不能挡播放）。
 //
@@ -32,7 +32,7 @@ export const MAX_USER_AGENT_LEN = 255;
 export const MAX_REFERER_LEN = 512;
 
 // 实现开关：storage 键 + 缺省值（缺省走新实现；native 未就绪时自动回退 v1）
-export const PLAYER_IMPL_KEY = 'bili_player_impl';
+export const PLAYER_IMPL_KEY = 'douyu_player_impl';
 export const PLAYER_IMPL_DEFAULT = 'v2';
 
 let mod = null;

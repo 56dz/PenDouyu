@@ -215,7 +215,8 @@ static JSValue js_open(JSContext *ctx, JSValueConst this_val, int argc, JSValueC
         if (input2) JS_FreeCString(ctx, input2);
         return mk_fail(ctx, "PLAYER_BAD_HEADERS", "referer 非法");
     }
-    /* input2 可选，但给了就必须合法（它是 B 站 DASH 的音频轨 URL） */
+    /* input2 可选，但给了就必须合法（原为 B 站 DASH 分离音频轨；斗鱼直播是单条
+     * FLV，JS 侧固定传空串，这里保留校验只为兼容 16 参数契约本身） */
     if (input2 && input2[0] && !valid_input(input2)) {
         JS_FreeCString(ctx, input);
         if (audio_dev) JS_FreeCString(ctx, audio_dev);
@@ -271,9 +272,10 @@ static JSValue js_open(JSContext *ctx, JSValueConst this_val, int argc, JSValueC
     /*
      * 【P0-3】第 16 个参数 = 显式直播意图（1=直播 / 0=点播 / 缺省 -1）。
      *
-     * native 不再靠「durationMs == 0 且是 http」猜直播 —— B 站 view 接口
+     * native 不再靠「durationMs == 0 且是 http」猜直播 —— 当初 B 站 view 接口
      * 对互动视频/部分港澳台条目会返回 duration: 0，那种点播被猜成直播后
      * 会走 flvdemux（DASH 分片不是 FLV）→ 无画面 + 永久失去 seek，且不报错。
+     * 斗鱼版只剩直播，JS 侧恒传 1，但契约仍按三态保留。
      * JS 侧 play_session.js 在 resolveLiveUrl / resolvePlayUrl 里明确知道
      * 自己在干什么，所以由它传意图，native 只信。
      *
@@ -304,8 +306,8 @@ static JSValue js_open(JSContext *ctx, JSValueConst this_val, int argc, JSValueC
     /*
      * 【兼容字段】open 的返回值在 v1（player.c:3781-3785）里带
      * outWidth/outHeight/fps/audioRate/audioBt，JS 侧
-     * src/services/play_session.js:356 与 src/services/bili/probe.js:229
-     * 都读它们打日志/存进 session。v2 若缺这些键，日志就是
+     * src/services/play_session.js 的 openVideo 读它们打日志/存进 session。
+     * v2 若缺这些键，日志就是
      * `open ok out=undefinedxundefined fps=undefined`（已真机复现），
      * 且 play.session.outWidth/outHeight 变成 undefined 传导到 UI。
      *

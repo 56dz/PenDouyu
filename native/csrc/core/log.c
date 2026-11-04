@@ -23,7 +23,7 @@ void pb2_log_init(void) {
     const char *env;
     if (g_fd >= 0) return;
 
-    env = getenv("PENBILI_PB2_LOG");
+    env = getenv("PENDOUYU_PB2_LOG");
     if (env && env[0] && strcmp(env, "0") != 0) {
         g_on = 1;
     } else if (access(PB2_LOG_SWITCH, F_OK) == 0) {

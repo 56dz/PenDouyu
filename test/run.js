@@ -1,8 +1,9 @@
 // 纯逻辑单测（Node 直接运行：node test/run.js）
-// 覆盖：MD5 对拍/向量、WBI 官方 worked example、net 归一化、client 四段错误语义、
-//       playurl 阶梯与 URL 校验、player 参数映射与 UA/Referer 校验、屏幕几何、
-//       probe 编排（成功/失败/取消）、storage schema、
-//       搜索三分栏条目归一化（视频/图文/直播）、图文正文三形态解析、评论类型契约（1/12）。
+// 覆盖：MD5 对拍/向量、斗鱼取流签名链路与播放 URL 拼装（doc §1 原样）、
+//       net 归一化、player 参数映射与 UA/Referer 校验、屏幕几何与保活、
+//       直播画质设置、play_session 直播判据/主动换链/状态归一、
+//       斗鱼列表与分类归一、autotest 种子守卫、live_end_probe 判据、
+//       native 管线源码契约。不联网：联网用例在 test/douyu_feed_test.js。
 const assert = require('assert');
 const crypto = require('crypto');
 
@@ -46,31 +47,9 @@ function test(name, fn) {
 }
 
 async function main() {
-  const { md5Hex } = await import('../src/services/bili/md5.js');
-  const { MIXIN_TABLE, deriveMixinKey, buildSignedQuery, encodeValue } = await import('../src/services/bili/wbi.js');
+
+  const { md5Hex } = await import('../src/services/md5.js');
   const { unwrapResponse, tryParseJson, toRuntimeHeader, httpGet } = await import('../src/services/net.js');
-  const {
-    createClient,
-    apiHeaders,
-    cookieFromSession,
-    describeBiliCode,
-    buildQuery,
-    DEFAULT_UA,
-    REFERER
-  } = await import('../src/services/bili/client.js');
-  const {
-    buildPlayurlParams,
-    buildPlayurlQuery,
-    validateStreamUrl,
-    parseHtml5Response,
-    parseDashResponse,
-    isAllowedHost,
-    hostOf,
-    dimsForQn,
-    QN_LADDER,
-    DASH_QN_LADDER,
-    HTML5_FPS
-  } = await import('../src/services/bili/playurl.js');
   const {
     buildOpenArgs,
     isSafeInput,
@@ -96,10 +75,6 @@ async function main() {
     trimToGridRows,
     KEEP_INTERVAL_MS,
     createScreenKeeper,
-    seekRatioFromX,
-    seekFillWidth,
-    SEEK_TRACK_WIDTH,
-    SEEK_FILL_MAX,
     keepScreenOnce,
     keepScreenBackend,
     getScreenState,
@@ -114,232 +89,105 @@ async function main() {
     keepScreenOff,
     keepScreenTicks
   } = await import('../src/services/screen.js');
-  const { runProbe, STEPS } = await import('../src/services/bili/probe.js');
-  const { normalizeStoredValue, normalizeSession, normalizeSettings, DEFAULT_TARGET } = await import(
-    '../src/services/storage.js'
-  );
-  const {
-    buildPlayInfoQuery,
-    unescapeExtra,
-    joinCodecUrl,
-    pickCodec,
-    parsePlayInfo,
-    fetchLivePlayUrl,
-    LIVE_FPS: LIVE_FPS_MOD,
-    LIVE_PLAYINFO_URL
-  } = await import('../src/services/bili/live.js');
-  // ---------------- 视频/直播设置（「我的」菜单） ----------------
-  // 「我的 → 视频调节 / 直播」设置层（纯函数，无 IO 的部分全覆盖）
+  const { normalizeStoredValue } = await import('../src/services/storage.js');
   const vsMod = await import('../src/services/video_settings.js');
-  test('video_settings: 默认值与脏数据归一', () => {
+  const {
+    openVideo,
+    resolveLiveUrl,
+    refreshLiveUrl,
+    togglePlay,
+    recoverSession,
+    readStatus,
+    closeSession,
+    describePlayError,
+    SEEK_STEP_MS,
+    LIVE_FPS,
+    LIVE_URL_TTL_MS,
+    LIVE_URL_REFRESH_MS,
+    shouldRefreshLiveUrl,
+    num,
+    numSigned,
+    numLatency,
+    normalizeState,
+    isLiveEnded,
+    isLiveReconnecting,
+    LIVE_RECONNECT_ERR
+  } = await import('../src/services/play_session.js');
+  const { isAutotestSeedEnabled, readAutotestSeed } = await import('../src/services/autotest_seed.js');
+  const { runLiveEndCases, LIVE_END_CASES } = await import('../src/services/live_end_probe.js');
+  const douyuApi = await import('../src/services/douyu/api.js');
+  const douyuNorm = await import('../src/services/douyu/normalize.js');
+  const douyuFeed = await import('../src/services/douyu/feed.js');
+  const douyuCate = await import('../src/services/douyu/cate.js');
+  const fsx = require('fs');
+  const pathx = require('path');
+
+  // 设备/接口层常量：产品代码里的唯一来源（不要在用例里另写一份 UA 串）
+  const TEST_UA = douyuApi.DOUYU_UA;
+  const TEST_REFERER = douyuApi.DOUYU_REFERER;
+
+  const nodeMd5 = (s) => crypto.createHash('md5').update(s, 'utf8').digest('hex');
+
+  // ---------------- 直播画质设置（「我的」菜单） ----------------
+
+  test('video_settings: 默认值与脏数据归一（只认 liveQuality）', () => {
     const d = vsMod.DEFAULT_VIDEO_SETTINGS;
-    // v3.6.0 起「自动」档被移除，点播默认改为 720p60（用户要求）
-    assert.strictEqual(d.videoQuality, '720p60');
-    assert.strictEqual(d.liveQuality, '720p60');
     assert.strictEqual(d.version, 2);
-    // v3.3.0 起分辨率与帧率合并为单一画质档，旧的两个字段必须已不存在
+    assert.strictEqual(d.liveQuality, '720p60');
+    // 点播字段已随纯直播重构删除，也不许再从存储里被回吐出来
+    assert.strictEqual(d.videoQuality, undefined);
     assert.strictEqual(d.videoFps, undefined);
     assert.strictEqual(d.liveFps, undefined);
     // 脏数据一律退回默认，绝不让一条坏记录把播放搞挂
     assert.deepStrictEqual(vsMod.normalizeVideoSettings(null), d);
     assert.deepStrictEqual(vsMod.normalizeVideoSettings('x'), d);
-    assert.deepStrictEqual(vsMod.normalizeVideoSettings({ version: 2, videoQuality: '4k' }).videoQuality, '720p60');
-    // 旧存储里残留的 'auto'（v3.5.x 及更早）也必须被收成 720p60，不能落到 1080p60
-    assert.deepStrictEqual(vsMod.normalizeVideoSettings({ version: 2, videoQuality: 'auto' }).videoQuality, '720p60');
-    assert.deepStrictEqual(vsMod.normalizeVideoSettings({ version: 2, liveQuality: 'auto' }).liveQuality, '720p60');
-    assert.deepStrictEqual(vsMod.normalizeVideoSettings({ version: 2, liveQuality: '1080p' }).liveQuality, '720p60');
+    // 不存在的旧档位必须回落**默认** 720p60，不能落到列表首项 480p30（画质会莫名变差）
+    assert.strictEqual(vsMod.normalizeVideoSettings({ liveQuality: 'auto' }).liveQuality, '720p60');
+    assert.strictEqual(vsMod.normalizeVideoSettings({ liveQuality: '1080p' }).liveQuality, '720p60');
+    // 归一结果只含契约字段（version + liveQuality）
+    assert.deepStrictEqual(
+      Object.keys(vsMod.normalizeVideoSettings({ videoQuality: '720p30' })).sort(),
+      ['liveQuality', 'version']
+    );
     // 合法值保留
-    const ok = vsMod.normalizeVideoSettings({ version: 2, videoQuality: '720p30', liveQuality: '720p60' });
-    assert.deepStrictEqual([ok.videoQuality, ok.liveQuality], ['720p30', '720p60']);
+    assert.strictEqual(vsMod.normalizeVideoSettings({ liveQuality: '480p30' }).liveQuality, '480p30');
   });
-  test('video_settings: 每个画质档都自带 fpsCap，不存在「360p + 60fps」这种服务端没有的组合', () => {
-    for (const q of vsMod.VIDEO_QUALITY_OPTIONS) {
-      assert.strictEqual(typeof q.fpsCap, 'number', q.id + ' 缺 fpsCap');
-      assert.ok(q.maxPixels > 0, q.id + ' 缺 maxPixels');
-      assert.ok(Array.isArray(q.ladder) && q.ladder.length > 0, q.id + ' 缺 ladder');
-      // label 必须同时写明分辨率与帧率（用户要求「写为 1080p 60fps 这样的」）
-      assert.ok(/p\s*\d+fps/.test(q.label), q.id + ' 的 label 没写清分辨率+帧率：' + q.label);
-    }
+
+  test('video_settings: 直播档自带 fpsCap 与完整 label（斗鱼只按 rate 取流，帧率本地封顶）', () => {
     for (const q of vsMod.LIVE_QUALITY_OPTIONS) {
       assert.strictEqual(typeof q.fpsCap, 'number', q.id + ' 缺 fpsCap');
-      assert.ok(q.qn > 0, q.id + ' 缺 qn');
-      assert.ok(/p\s*\d+fps/.test(q.label), q.id + ' 的 label 不明确：' + q.label);
+      assert.ok(/p\s*\d+fps/.test(q.label), q.id + ' 的 label 没写清分辨率+帧率：' + q.label);
     }
-    // 480p/360p 只有 30fps 变体：必须锁 30，且阶梯里不能出现 60fps 专档（116/74）
-    const low = vsMod.VIDEO_QUALITY_OPTIONS.filter((q) => q.id === '480p30' || q.id === '360p30');
-    assert.strictEqual(low.length, 2);
-    for (const q of low) {
-      assert.strictEqual(q.fpsCap, 30, q.id + ' 必须锁 30fps');
-      assert.ok(q.ladder.indexOf(116) < 0 && q.ladder.indexOf(74) < 0, q.id + ' 阶梯里混进了 60fps 专档');
-    }
+    assert.strictEqual(vsMod.liveFpsCapFor({ liveQuality: '720p60' }), 0, '60fps 档不封顶');
+    assert.strictEqual(vsMod.liveFpsCapFor({ liveQuality: '480p30' }), 30);
+    assert.strictEqual(vsMod.liveFpsCapFor(null), 0, '脏输入回落默认档（不封顶）');
+    assert.strictEqual(vsMod.liveQualityLabel({ liveQuality: '720p30' }), '720p 30fps');
+    assert.strictEqual(vsMod.liveQualityLabel(null), '720p 60fps');
   });
+
   test('video_settings: nextOptionId 轮转（首尾闭合，未知 id 从头开始）', () => {
-    const list = vsMod.VIDEO_QUALITY_OPTIONS;
+    const list = vsMod.LIVE_QUALITY_OPTIONS;
     assert.strictEqual(vsMod.nextOptionId(list, list[0].id), list[1].id);
     assert.strictEqual(vsMod.nextOptionId(list, list[list.length - 1].id), list[0].id);
     assert.strictEqual(vsMod.nextOptionId(list, '不存在'), list[0].id);
     assert.strictEqual(vsMod.nextOptionId([], 'x'), 'x');
     assert.strictEqual(vsMod.nextOptionId(null, 'x'), 'x');
   });
-  test('video_settings: dashLadderFor 直接取画质档自带阶梯（60fps 档已把 30fps 变体排前）', () => {
-    // 默认 720p60：阶梯从 720P60 专档起，不含 1080P（116/80）
-    assert.deepStrictEqual(vsMod.dashLadderFor(vsMod.DEFAULT_VIDEO_SETTINGS), [74, 64, 32, 16]);
-    // 显式选 1080p60 才给满阶梯
-    assert.deepStrictEqual(vsMod.dashLadderFor({ version: 2, videoQuality: '1080p60' }), [116, 80, 74, 64, 32, 16]);
-    // 1080p30：30fps 变体 80 优先，116/74 留作保底（有些稿件只有 60fps 档）
-    assert.deepStrictEqual(vsMod.dashLadderFor({ version: 2, videoQuality: '1080p30' }), [80, 116, 74, 64, 32, 16]);
-    assert.deepStrictEqual(vsMod.dashLadderFor({ version: 2, videoQuality: '720p30' }), [64, 74, 32, 16]);
-    // 分辨率档位收窄阶梯（360p 只留 16，保证不会偷偷拉高分辨率）
-    assert.deepStrictEqual(vsMod.dashLadderFor({ version: 2, videoQuality: '360p30' }), [16]);
-    assert.deepStrictEqual(vsMod.dashLadderFor({ version: 2, videoQuality: '480p30' }), [32, 16]);
-  });
-  test('video_settings: fpsCap / pixelBudget / liveQn 与选项表一致', () => {
-    // 'auto' 已不存在 → 归一成默认 720p60（fpsCap 0）
-    assert.strictEqual(vsMod.videoFpsCapFor({ version: 2, videoQuality: 'auto' }), 0);
-    assert.strictEqual(vsMod.videoFpsCapFor({ version: 2, videoQuality: '720p60' }), 0);
-    assert.strictEqual(vsMod.videoFpsCapFor({ version: 2, videoQuality: '1080p60' }), 0);
-    assert.strictEqual(vsMod.videoFpsCapFor({ version: 2, videoQuality: '1080p30' }), 30);
-    assert.strictEqual(vsMod.videoFpsCapFor({ version: 2, videoQuality: '720p30' }), 30);
-    assert.strictEqual(vsMod.pixelBudgetFor({ version: 2, videoQuality: '1080p60' }), 1920 * 1080);
-    // 旧 'auto' 记录现在按 720p60 算像素预算，不会偷偷拉 1080p
-    assert.strictEqual(vsMod.pixelBudgetFor({ version: 2, videoQuality: 'auto' }), 1280 * 720);
-    assert.strictEqual(vsMod.pixelBudgetFor({ version: 2, videoQuality: '720p60' }), 1280 * 720);
-    assert.strictEqual(vsMod.pixelBudgetFor({ version: 2, videoQuality: '360p30' }), 640 * 360);
-    assert.strictEqual(vsMod.liveQnFor({ version: 2, liveQuality: '480p30' }), 150);
-    assert.strictEqual(vsMod.liveQnFor({ version: 2, liveQuality: '720p30' }), 250);
-    // 直播「自动」档已移除：旧记录归一到默认 480p30（qn=150）
-    assert.strictEqual(vsMod.liveQnFor({ version: 2, liveQuality: 'auto' }), 250);
-    assert.strictEqual(vsMod.liveFpsCapFor({ version: 2, liveQuality: '480p30' }), 30);
-    assert.strictEqual(vsMod.liveFpsCapFor({ version: 2, liveQuality: '720p60' }), 0);
-    assert.strictEqual(vsMod.liveFpsCapFor({ version: 2, liveQuality: 'auto' }), 0);
-  });
-  test('video_settings: label 转发与选项表一致（菜单直接展示）', () => {
-    assert.strictEqual(vsMod.videoQualityLabel({ version: 2, videoQuality: '720p60' }), '720p 60fps');
-    assert.strictEqual(vsMod.videoQualityLabel({ version: 2, videoQuality: '1080p30' }), '1080p 30fps');
-    assert.strictEqual(vsMod.liveQualityLabel({ version: 2, liveQuality: '480p30' }), '480p 30fps（省流）');
-    // 脏值退回默认档（720p60）的 label，不抛
-    assert.strictEqual(vsMod.videoQualityLabel({ version: 2, videoQuality: 'zzz' }), '720p 60fps');
-  });
-  test('video_settings: v1 老记录（分辨率+帧率两字段）迁移到合并画质档', () => {
-    const mig = (vq, vf, lq, lf) => vsMod.normalizeVideoSettings({ version: 1, videoQuality: vq, videoFps: vf, liveQuality: lq, liveFps: lf });
-    // 常见组合逐个映射，且迁移后不再保留旧字段
-    // 注意：这些用例只传了 videoQuality/videoFps，直播两个字段是 undefined，
-    // 查不到迁移表 → 落到 DEFAULT.liveQuality（v3.6.0 起是 720p60）
-    const cases = [
-      [['auto', 'auto'], '720p60', '720p60'],
-      [['auto', '60'], '1080p60', '720p60'],
-      [['auto', '30'], '1080p30', '720p60'],
-      [['1080p', '60'], '1080p60', '720p60'],
-      [['1080p', '30'], '1080p30', '720p60'],
-      [['720p', 'auto'], '720p60', '720p60'],
-      [['720p', '30'], '720p30', '720p60'],
-      [['480p', 'auto'], '480p30', '720p60'],
-      // 老记录里能选出「360p + 60fps」这种服务端不存在的组合 → 必须收成 360p30
-      [['360p', '60'], '360p30', '720p60'],
-      [['360p', '30'], '360p30', '720p60']
-    ];
-    for (const [args, vq, lq] of cases) {
-      const r = mig(args[0], args[1]);
-      assert.strictEqual(r.videoQuality, vq, '迁移 ' + args.join('/') + ' → ' + r.videoQuality);
-      assert.strictEqual(r.liveQuality, lq, '迁移 ' + args.join('/') + ' live → ' + r.liveQuality);
-      assert.strictEqual(r.videoFps, undefined, '迁移后不该再有 videoFps');
-      assert.strictEqual(r.liveFps, undefined, '迁移后不该再有 liveFps');
-      assert.strictEqual(r.version, 2);
-    }
-    // 直播侧：老「720p + 60fps」迁移到 720p60，老「480p + 60fps」没有对应档 → 退 720p60
-    assert.strictEqual(mig('auto', 'auto', '720p', '60').liveQuality, '720p60');
-    assert.strictEqual(mig('auto', 'auto', '480p', '60').liveQuality, '720p60');
-    assert.strictEqual(mig('auto', 'auto', '720p', '30').liveQuality, '720p30');
-    assert.strictEqual(mig('auto', 'auto', 'auto', 'auto').liveQuality, '720p60');
-    // 认不出来的老组合一律落 720p60，不能因为一条旧记录起不来
-    assert.strictEqual(vsMod.normalizeVideoSettings({ version: 1, videoQuality: '4k', videoFps: '144' }).videoQuality, '720p60');
-  });
-
-  const feedMod = await import('../src/services/feed.js');
-  const {
-    normalizeVideo,
-    normalizeSearch,
-    normalizeSearchArticle,
-    normalizeSearchLive,
-    normalizeCover,
-    formatDuration,
-    formatCount,
-    parseDuration,
-    stripHtml,
-    appendDeduped,
-    fetchRecommended,
-    fetchPopular,
-    searchVideos,
-    searchBili,
-    describeListError,
-    RCMD_PAGE_SIZE,
-    MAX_ITEMS
-  } = feedMod;
-  const { normalizeHistory, pushHistory, HISTORY_VERSION, MAX_HISTORY, formatHistoryTime } = await import(
-    '../src/services/history.js'
-  );
-  const {
-    openVideo,
-    resolveVideoUrl,
-    resolveLiveUrl,
-    togglePlay,
-    seekBy,
-    seekTo,
-    recoverSession,
-    readStatus,
-    closeSession,
-    describePlayError,
-    ensureMixin,
-    ensureMixinResult,
-    SEEK_STEP_MS,
-    num,
-    numSigned,
-    numLatency,
-    normalizeState,
-    waitLanded,
-    waitFirstFrame,
-    isStreamEnded,
-    END_TAIL_MS,
-    END_DEAD_TAIL_MS,
-    isLiveEnded,
-    isLiveReconnecting,
-    LIVE_RECONNECT_ERR,
-    SEEK_LAND_NEAR_MS,
-    SEEK_LAND_DEADLINE_MS,
-    seekNoteDone,
-    LIVE_URL_TTL_MS,
-    LIVE_URL_REFRESH_MS,
-    shouldRefreshLiveUrl,
-    refreshLiveUrl
-  } = await import('../src/services/play_session.js');
-  const { fetchReplies, addReply, parseReplies, normalizeReply, replyType } = await import('../src/services/bili/reply.js');
-  const { isAutotestSeedEnabled, readAutotestSeed } = await import('../src/services/autotest_seed.js');
-  /* 直播下播判据的真机自证用例表（与真机 probeLiveEnd 同源） */
-  const { runLiveEndCases, LIVE_END_CASES } = await import('../src/services/live_end_probe.js');
-  const {
-    opusToBlocks,
-    opsToBlocks,
-    decodeEntities,
-    htmlToBlocks,
-    parseArticle,
-    fetchArticle
-  } = await import('../src/services/bili/article.js');
-  const fsx = require('fs');
-  const pathx = require('path');
-  const fixture = (n) => JSON.parse(fsx.readFileSync(pathx.join(__dirname, '..', 'api-mock', 'fixtures', n), 'utf8'));
-
-  const nodeMd5 = (s) => crypto.createHash('md5').update(s, 'utf8').digest('hex');
 
   // ---------------- md5 ----------------
+
   test('md5: 空串向量', () => {
     assert.strictEqual(md5Hex(''), 'd41d8cd98f00b204e9800998ecf8427e');
   });
+
   test('md5: "abc" 向量', () => {
     assert.strictEqual(md5Hex('abc'), '900150983cd24fb0d6963f7d28e17f72');
   });
+
   test('md5: fox 向量', () => {
     assert.strictEqual(md5Hex('The quick brown fox jumps over the lazy dog'), '9e107d9d372bb6826bd81d3542a419d6');
   });
+
   test('md5: 对拍 node crypto（含 55/56/64 填充边界与 UTF-8）', () => {
     const samples = [
       'bar=514&foo=114&wts=1702204169&zab=1919810',
@@ -353,371 +201,39 @@ async function main() {
     for (const s of samples) assert.strictEqual(md5Hex(s), nodeMd5(s), JSON.stringify(s.slice(0, 12)));
   });
 
-  // ---------------- wbi ----------------
-  test('wbi: MIXIN_TABLE 是 0..63 的置换', () => {
-    assert.strictEqual(MIXIN_TABLE.length, 64);
-    assert.strictEqual(new Set(MIXIN_TABLE).size, 64);
-    for (let i = 0; i < MIXIN_TABLE.length; i++) assert.ok(MIXIN_TABLE[i] >= 0 && MIXIN_TABLE[i] <= 63);
-  });
-  test('wbi: 官方 worked example 完整复现', () => {
-    const q = buildSignedQuery({ foo: 114, bar: 514, zab: 1919810 }, 'ea1db124af3c7062474693fa704f4ff8', 1702204169);
-    assert.strictEqual(q, 'bar=514&foo=114&wts=1702204169&zab=1919810&w_rid=8f6f2b5b3d485fe1886cec6a0be8c5d4');
-  });
-  test('wbi: deriveMixinKey 输出 32 位 hex', () => {
-    const k = deriveMixinKey('74e6d6d06a3a1f1e7a7a66b7de92c16f', '56a5b7c8e9fa0b1c2d3e4f5a6b7c8d9e');
-    assert.ok(/^[0-9a-f]{32}$/.test(k));
-    assert.strictEqual(deriveMixinKey('', '').length, 0);
-  });
-  test("wbi: 值剔除 !'()* 再编码", () => {
-    assert.strictEqual(encodeValue("a'b*c!d(e)f"), 'abcdef');
-    assert.strictEqual(encodeValue('x y'), 'x%20y');
-  });
-  test('wbi: 与参数顺序无关、wts 变则签名变', () => {
-    const a = buildSignedQuery({ bvid: 'BV1xx', qn: 32 }, 'a'.repeat(32), 1700000000);
-    const b = buildSignedQuery({ qn: 32, bvid: 'BV1xx' }, 'a'.repeat(32), 1700000000);
-    assert.strictEqual(a, b);
-    const c = buildSignedQuery({ bvid: 'BV1xx', qn: 32 }, 'a'.repeat(32), 1700000001);
-    assert.notStrictEqual(a, c);
-    assert.ok(a.indexOf('&w_rid=') > 0);
-    assert.ok(a.indexOf('wts=1700000000') > 0);
-  });
-
   // ---------------- net ----------------
+
   test('net: unwrapResponse 成功路径默认 200', () => {
     const r = unwrapResponse({ result: '{"a":1}' });
     assert.strictEqual(r.statusCode, 200);
     assert.strictEqual(r.body, '{"a":1}');
   });
+
   test('net: unwrapResponse error:3 解析 resCode', () => {
     const r = unwrapResponse({ error: 3, result: { errorMessage: 'curl: (28) resCode:504' } });
     assert.strictEqual(r.statusCode, 504);
     assert.ok(r.errorMessage.indexOf('resCode') >= 0);
   });
+
   test('net: tryParseJson 只解析 JSON 形态文本', () => {
     assert.deepStrictEqual(tryParseJson('{"x":1}'), { x: 1 });
     assert.strictEqual(tryParseJson('not json'), 'not json');
     assert.strictEqual(tryParseJson(''), null);
     assert.strictEqual(tryParseJson('[1,2]').length, 2);
   });
+
   test('net: toRuntimeHeader 只保留非空字符串值', () => {
     assert.deepStrictEqual(toRuntimeHeader({ 'User-Agent': 'x', Empty: '', n: 3 }), { 'User-Agent': 'x' });
     assert.strictEqual(toRuntimeHeader({}), null);
     assert.strictEqual(toRuntimeHeader(null), null);
   });
+
   test('net: 无 $falcon 时 httpGet 以 NET_UNAVAILABLE 拒绝', async () => {
     await assert.rejects(() => httpGet('https://x/'), /NET_UNAVAILABLE/);
   });
 
-  // ---------------- client ----------------
-  const okGet = (body, status) => async () => ({ statusCode: status || 200, body: JSON.stringify(body) });
-
-  test('client: nav code=-101 仍给出 wbi 密钥', async () => {
-    const c = createClient({
-      get: okGet({
-        code: -101,
-        data: {
-          wbi_img: {
-            img_url: 'https://i0.hdslb.com/bfs/wbi/74e6d6d06a3a1f1e7a7a66b7de92c16f.png',
-            sub_url: 'https://i0.hdslb.com/bfs/wbi/56a5b7c8e9fa0b1c2d3e4f5a6b7c8d9e.png'
-          }
-        }
-      })
-    });
-    const r = await c.fetchWbiKeys();
-    assert.strictEqual(r.ok, true);
-    assert.strictEqual(r.code, -101);
-    assert.strictEqual(r.imgKey, '74e6d6d06a3a1f1e7a7a66b7de92c16f');
-    assert.strictEqual(r.subKey, '56a5b7c8e9fa0b1c2d3e4f5a6b7c8d9e');
-  });
-  test('client: nav 双栈兜底 —— jsapi.http 失败时 native libcurl 接管', async () => {
-    const wbiBody = JSON.stringify({
-      code: -101,
-      data: {
-        wbi_img: {
-          img_url: 'https://i0.hdslb.com/bfs/wbi/' + 'a'.repeat(32) + '.png',
-          sub_url: 'https://i0.hdslb.com/bfs/wbi/' + 'b'.repeat(32) + '.png'
-        }
-      }
-    });
-    let nativeCalls = 0;
-    let nativeHeaders = null;
-    const c = createClient({
-      get: async () => ({ statusCode: 200, body: '<html>risk</html>' }), // jsapi 栈：非 JSON
-      getTextNative: async (url, o) => {
-        nativeCalls++;
-        nativeHeaders = o.headers;
-        return { statusCode: 200, body: wbiBody, errorMessage: '' };
-      }
-    });
-    const r = await c.fetchWbiKeys();
-    assert.strictEqual(nativeCalls, 1);
-    assert.strictEqual(r.ok, true);
-    assert.strictEqual(r.imgKey, 'a'.repeat(32));
-    assert.strictEqual(nativeHeaders.Origin, 'https://www.bilibili.com'); // native 栈带浏览器头
-  });
-  test('client: nav 双栈皆败 → 保留信息量大的错误（stage=api 优先）', async () => {
-    const c = createClient({
-      get: async () => ({ statusCode: 200, body: JSON.stringify({ code: -352, message: 'risk' }) }),
-      getTextNative: async () => {
-        throw new Error('NET_NATIVE_MISSING: 缺少 libjsapi_httpjson.so');
-      }
-    });
-    const r = await c.fetchWbiKeys();
-    assert.strictEqual(r.ok, false);
-    assert.strictEqual(r.stage, 'api'); // 不用 transport 覆盖
-    assert.strictEqual(r.code, -352);
-  });
-  test('client: nav 瞬态抽风短退避重试（transport 失败后第 3 趟成功）', async () => {
-    const wbiBody = JSON.stringify({
-      code: -101,
-      data: {
-        wbi_img: {
-          img_url: 'https://i0.hdslb.com/bfs/wbi/' + 'c'.repeat(32) + '.png',
-          sub_url: 'https://i0.hdslb.com/bfs/wbi/' + 'd'.repeat(32) + '.png'
-        }
-      }
-    });
-    let n = 0;
-    const c = createClient({
-      // 第 1 趟 jsapi 模拟 DNS 解析超时（真机 YHttpManager 实测该故障）
-      get: async () => {
-        n++;
-        if (n === 1) throw new Error('Resolving timed out after 6000 milliseconds');
-        return { statusCode: 200, body: wbiBody };
-      },
-      getTextNative: async () => {
-        throw new Error('also down');
-      }
-    });
-    const r = await c.fetchWbiKeys();
-    assert.strictEqual(r.ok, true);
-    assert.strictEqual(r.via, 'jsapi');
-    assert.strictEqual(r.imgKey, 'c'.repeat(32));
-    assert.strictEqual(n, 2); // 第 3 趟（jsapi）才成功
-  });
-  test('client: -352 → stage=api + 风控文案 + v_voucher 标记', async () => {
-    const c = createClient({ get: okGet({ code: -352, message: 'risk', data: { v_voucher: 'v1' } }) });
-    const r = await c.fetchView('BV1ZCeb6NEyM');
-    assert.strictEqual(r.ok, false);
-    assert.strictEqual(r.stage, 'api');
-    assert.strictEqual(r.code, -352);
-    assert.ok(r.message.indexOf('风控') >= 0);
-    assert.ok(r.message.indexOf('v_voucher') >= 0);
-  });
-  test('client: HTTP 非 2xx → stage=http（body 不可得也自洽）', async () => {
-    const c = createClient({ get: async () => ({ statusCode: 412, body: '', errorMessage: 'curl: (0)' }) });
-    const r = await c.fetchView('BV1ZCeb6NEyM');
-    assert.strictEqual(r.stage, 'http');
-    assert.strictEqual(r.status, 412);
-  });
-  test('client: 非 JSON → stage=parse', async () => {
-    const c = createClient({ get: async () => ({ statusCode: 200, body: '<html>x</html>' }) });
-    const r = await c.fetchView('BV1ZCeb6NEyM');
-    assert.strictEqual(r.stage, 'parse');
-  });
-  test('client: transport 异常 → stage=transport 透传消息', async () => {
-    const c = createClient({
-      get: async () => {
-        throw new Error('NET_TIMEOUT: 请求超时(15000ms)');
-      }
-    });
-    const r = await c.fetchView('BV1ZCeb6NEyM');
-    assert.strictEqual(r.stage, 'transport');
-    assert.ok(r.message.indexOf('NET_TIMEOUT') >= 0);
-  });
-  test('client: 请求头必含 UA+Referer，Cookie 可回填', async () => {    let seen = null;
-    const c = createClient({
-      get: async (url, o) => {
-        seen = o.headers;
-        return { statusCode: 200, body: '{"code":0,"data":{}}' };
-      }
-    });
-    await c.fetchView('BV1ZCeb6NEyM');
-    assert.strictEqual(seen['User-Agent'], DEFAULT_UA);
-    assert.strictEqual(seen.Referer, REFERER);
-    assert.ok(!('Cookie' in seen));
-    c.setCookie(cookieFromSession({ version: 1, buvid3: 'B3-1', buvid4: 'B4-1' }));
-    await c.fetchView('BV1ZCeb6NEyM');
-    assert.strictEqual(seen.Cookie, 'buvid3=B3-1; buvid4=B4-1');
-  });
-  test('client: fetchView 宽高解析（dimension/rotate 互换/pages 兜底/缺 cid 报错）', async () => {
-    const c1 = createClient({ get: okGet({ code: 0, data: { cid: 42, aid: 7, title: 'T', duration: 90, dimension: { width: 1920, height: 1080, rotate: 0 } } }) });
-    const v = await c1.fetchView('BV1ZCeb6NEyM');
-    assert.strictEqual(v.cid, 42);
-    assert.strictEqual(v.duration, 90);
-    assert.strictEqual(v.width, 1920);
-    assert.strictEqual(v.height, 1080);
-    // rotate=90 → 显示宽高互换（与 ffmpeg autorotate 转正后的方向一致）
-    const c2 = createClient({ get: okGet({ code: 0, data: { cid: 43, duration: 10, dimension: { width: 1920, height: 1080, rotate: 90 } } }) });
-    const v2 = await c2.fetchView('BV1ZCeb6NEyM');
-    assert.strictEqual(v2.width, 1080);
-    assert.strictEqual(v2.height, 1920);
-    // 主体无 dimension → pages[0].dimension
-    const c3 = createClient({ get: okGet({ code: 0, data: { cid: 44, duration: 5, pages: [{ dimension: { width: 720, height: 1280, rotate: 0 } }] } }) });
-    const v3 = await c3.fetchView('BV1ZCeb6NEyM');
-    assert.strictEqual(v3.width, 720);
-    assert.strictEqual(v3.height, 1280);
-    // 全缺失 → 16:9 兜底（不炸、不给0）
-    const c4 = createClient({ get: okGet({ code: 0, data: { cid: 45, duration: 5 } }) });
-    const v4 = await c4.fetchView('BV1ZCeb6NEyM');
-    assert.strictEqual(v4.width, 640);
-    assert.strictEqual(v4.height, 360);
-    // 缺 cid 报错
-    const c5 = createClient({ get: okGet({ code: 0, data: { cid: 0 } }) });
-    const v5 = await c5.fetchView('BV1ZCeb6NEyM');
-    assert.strictEqual(v5.ok, false);
-  });
-  test('client: buildQuery 字符串透传、对象编码', () => {
-    assert.strictEqual(buildQuery('a=1&b=%20x'), 'a=1&b=%20x');
-    assert.strictEqual(buildQuery({ a: 1, b: 'x y' }), 'a=1&b=x%20y');
-    assert.strictEqual(buildQuery(null), '');
-  });
-  test('client: describeBiliCode 收录/未收录码', () => {
-    assert.ok(describeBiliCode(-12345).indexOf('-12345') >= 0);
-    assert.ok(describeBiliCode(-412).indexOf('412') >= 0);
-    assert.ok(describeBiliCode(-101).indexOf('未登录') >= 0);
-    assert.ok(describeBiliCode(62002, true).indexOf('v_voucher') >= 0);
-  });
-  test('client: apiHeaders 基本形状', () => {
-    const h = apiHeaders('');
-    assert.ok(h['User-Agent'].indexOf('Mozilla') === 0);
-    assert.strictEqual(h.Referer, 'https://www.bilibili.com/');
-    assert.ok(!('Cookie' in h));
-    assert.strictEqual(apiHeaders('c=1').Cookie, 'c=1');
-  });
-
-  // ---------------- playurl ----------------
-  test('playurl: html5 360p 参数族，阶梯永不含 720p', () => {
-    const p = buildPlayurlParams({ bvid: 'BV1ZCeb6NEyM', cid: 42, qn: 32 });
-    assert.strictEqual(p.fnval, 1);
-    // 主路径 DASH：fnval=16 显式覆盖；回退路径默认 1
-    assert.strictEqual(buildPlayurlParams({ bvid: 'BV1ZCeb6NEyM', cid: 42, qn: 16, fnval: 16 }).fnval, 16);
-    assert.strictEqual(p.platform, 'html5');
-    assert.strictEqual(p.high_quality, 1);
-    assert.strictEqual(p.fourk, 0);
-    assert.ok(QN_LADDER.every((q) => q < 64));
-    // v2.6.1：durl 回退仍只走 16（单文件路径没有独立的硬解收益，保底即可）
-    assert.deepStrictEqual(QN_LADDER, [16]);
-    // v3.1.3：DASH 阶梯改为高画质优先 + 显式请求 60fps 档。
-    // 硬解实测 1080p60+旋转实时仍 56.20fps/dropped 0，面板 59.88Hz 能吃下；
-    // 而 360p 在 240x427 物理窗口上糊得用户以为掉帧。
-    assert.deepStrictEqual(DASH_QN_LADDER, [116, 80, 74, 32, 16]);
-    assert.strictEqual(DASH_QN_LADDER[0], 116, '首选 1080P60');
-    assert.ok(DASH_QN_LADDER.indexOf(74) > 0, '阶梯含 720P60');
-    assert.strictEqual(DASH_QN_LADDER[DASH_QN_LADDER.length - 1], 16, '末档保底 360p');
-    // DASH 参数集：fnval=16 且**不带 platform=html5**（服务端见 html5 强制降级 durl，真机回退日志坐实）
-    const dp = buildPlayurlParams({ bvid: 'BV1ZCeb6NEyM', cid: 42, qn: 16, fnval: 16 });
-    assert.strictEqual(dp.fnval, 16);
-    assert.strictEqual(dp.platform, undefined);
-    assert.strictEqual(dp.high_quality, undefined);
-  });
-  test('playurl: buildPlayurlQuery 拒绝坏 bvid/cid/密钥', () => {
-    assert.strictEqual(buildPlayurlQuery({ bvid: 'xx', cid: 1 }, 'a'.repeat(32), 1).ok, false);
-    assert.strictEqual(buildPlayurlQuery({ bvid: 'BV1ZCeb6NEyM', cid: 0 }, 'a'.repeat(32), 1).ok, false);
-    assert.strictEqual(buildPlayurlQuery({ bvid: 'BV1ZCeb6NEyM', cid: 1 }, 'short', 1).ok, false);
-    const good = buildPlayurlQuery({ bvid: 'BV1ZCeb6NEyM', cid: 1 }, 'a'.repeat(32), 1700000000);
-    assert.strictEqual(good.ok, true);
-    assert.ok(good.query.indexOf('platform=html5') > 0);
-    assert.ok(good.query.indexOf('w_rid=') > 0);
-  });
-  test('playurl: URL 硬校验（https/无空白/无../≤1000）', () => {
-    const good = 'https://upos-sz-mirrorcos.bilivideo.com/upgcxcode/1/2/v.mp4?deadline=1&platform=html5&upsig=abc';
-    const ok = validateStreamUrl(good);
-    assert.strictEqual(ok.ok, true);
-    assert.strictEqual(ok.host, 'upos-sz-mirrorcos.bilivideo.com');
-    assert.strictEqual(ok.allowlisted, true);
-    assert.strictEqual(validateStreamUrl('http://x/v.mp4').ok, false);
-    assert.strictEqual(validateStreamUrl('https://x/a b.mp4').ok, false);
-    assert.strictEqual(validateStreamUrl('https://x/' + 'a'.repeat(1000)).ok, false);
-    assert.strictEqual(validateStreamUrl('https://x/\u0001.mp4').ok, false);
-    assert.strictEqual(validateStreamUrl('https://x/../v.mp4').ok, false);
-    assert.strictEqual(validateStreamUrl('').ok, false);
-    assert.strictEqual(validateStreamUrl(null).ok, false);
-    const unknown = validateStreamUrl('https://cdn.example-host.org/v.mp4');
-    assert.strictEqual(unknown.ok, true);
-    assert.strictEqual(unknown.allowlisted, false);
-  });
-  test('playurl: hostOf / isAllowedHost 边界（不误配表外域）', () => {
-    assert.strictEqual(hostOf('https://A.Bilivideo.com:443/x'), 'A.Bilivideo.com:443');
-    assert.strictEqual(isAllowedHost('bilivideo.com'), true);
-    assert.strictEqual(isAllowedHost('upos.bilivideo.com'), true);
-    assert.strictEqual(isAllowedHost('evilbilivideo.com'), false);
-    assert.strictEqual(isAllowedHost(''), false);
-  });
-  test('playurl: parseDashResponse（qn池 + avc1优先 + 最低档音频 + timelength）', () => {
-    const fx = fixture('playurl_dash.json');
-    const r = parseDashResponse({ ok: true, code: 0, data: fx.data }, 16);
-    assert.strictEqual(r.ok, true, r.message);
-    assert.strictEqual(r.qn, 16);
-    // id16 池有 hevc(147670) 与 avc1(230931) 两条 → 必选 avc1（A53 软解避开 HEVC）
-    assert.strictEqual(r.codecs.indexOf('avc1'), 0, r.codecs);
-    assert.strictEqual(r.bandwidth, 230931);
-    assert.strictEqual(r.audioBandwidth, 65716, '音频取最低档 66kbps');
-    // URL 选快域：main 是 mcdn:8082（实测5-6s慢节点）→ 必须切到 backup 的 bilivideo.com:443（0.3s）
-    assert.ok(r.videoUrl.indexOf('cn-gdjm-cm-01-01.bilivideo.com') > 0, r.videoUrl.slice(0, 80));
-    assert.ok(r.audioUrl.indexOf('cn-gdjm-cm-01-01.bilivideo.com') > 0, r.audioUrl.slice(0, 80));
-    assert.ok(r.videoUrl.indexOf('mountaintoys') < 0, '非白名单域必须淘汰');
-    assert.ok(r.videoUrl.indexOf(':8082') < 0, '烂端口域不得当选');
-    assert.strictEqual(r.durationMs, 280128, 'timelength 直接给权威时长');
-    const r32 = parseDashResponse({ ok: true, code: 0, data: fx.data }, 32);
-    assert.strictEqual(r32.codecs.indexOf('avc1'), 0);
-    assert.strictEqual(r32.bandwidth, 355354);
-    // 无 dash 结构 → 回退信号（durl 在 → hasDurl）
-    const no = parseDashResponse({ ok: true, code: 0, data: { durl: [{ url: 'https://x/v.mp4' }] } }, 16);
-    assert.strictEqual(no.ok, false);
-    assert.strictEqual(no.hasDurl, true);
-    assert.strictEqual(parseDashResponse({ ok: true, code: 0, data: {} }, 16).hasDurl, false);
-    // 无音频轨（纯无声稿件）
-    const mute = parseDashResponse({ ok: true, code: 0, data: { dash: { video: fx.data.dash.video, audio: [] } } }, 16);
-    assert.strictEqual(mute.ok, true);
-    assert.strictEqual(mute.audioUrl, '');
-    // 传输/请求失败
-    assert.strictEqual(parseDashResponse({ ok: false, stage: 'transport', message: 'x' }).stage, 'transport');
-    assert.strictEqual(parseDashResponse(null, 16).ok, false);
-  });
-  test('playurl: DASH 选流取预算内最高分辨率并优先 AVC', () => {
-    const mk = (video) => ({ ok: true, code: 0, data: { timelength: 1000, dash: { video: video, audio: [{ id: 30216, bandwidth: 65000, baseUrl: 'https://a.bilivideo.com/a.m4s' }] } } });
-    const v360 = { id: 16, width: 640, height: 360, bandwidth: 230000, codecs: 'avc1.64001E', baseUrl: 'https://a.bilivideo.com/v16.m4s' };
-    const hevc360 = { id: 16, width: 640, height: 360, bandwidth: 90000, codecs: 'hvc1.1.6.L120.90', baseUrl: 'https://a.bilivideo.com/h16.m4s' };
-    const v480 = { id: 32, width: 852, height: 480, bandwidth: 400000, codecs: 'avc1.64001F', baseUrl: 'https://a.bilivideo.com/v32.m4s' };
-    const hevc480 = { id: 32, width: 852, height: 480, bandwidth: 200000, codecs: 'hvc1.1.6.L120.90', baseUrl: 'https://a.bilivideo.com/h32.m4s' };
-    // 同池有 480p 时**不能**退回 360p（软解时代的「取最小」策略已被硬解推翻）
-    const p = parseDashResponse(mk([v480, hevc480, hevc360, v360]), 80, false);
-    assert.strictEqual(p.ok, true, p.message);
-    assert.strictEqual(p.width, 852, '应选服务端给的最高分辨率');
-    assert.strictEqual(p.height, 480);
-    assert.strictEqual(p.codecs.indexOf('avc1'), 0, '同分辨率优先 avc1');
-    assert.ok(p.avail.indexOf('16:640x360') >= 0, '诊断应包含 360p 档位');
-    assert.ok(p.avail.indexOf('32:852x480') >= 0, '诊断应包含 480p 档位');
-    // 只有 360p 时仍能播（阶梯退到底也不至于失败）
-    const only360 = parseDashResponse(mk([hevc360, v360]), 80, false);
-    assert.strictEqual(only360.ok, true);
-    assert.strictEqual(only360.width, 640);
-    // requireAvc=1 且该池只有 HEVC → codec 错误，交调用方试下一档
-    const onlyHevc = parseDashResponse(mk([hevc360]), 80, true);
-    assert.strictEqual(onlyHevc.ok, false);
-    assert.strictEqual(onlyHevc.stage, 'codec');
-  });
-  test('playurl: parseHtml5Response 正常/无 durl/请求失败', () => {
-    const good = parseHtml5Response({
-      ok: true,
-      code: 0,
-      data: { quality: 32, durl: [{ url: 'https://c/v.mp4', length: 123 }], accept_quality: [32, 16] }
-    });
-    assert.strictEqual(good.ok, true);
-    assert.strictEqual(good.sizeBytes, 123);
-    assert.strictEqual(good.quality, 32);
-    assert.strictEqual(parseHtml5Response({ ok: true, code: 0, data: { durl: [] } }).ok, false);
-    assert.strictEqual(parseHtml5Response({ ok: false, stage: 'api', code: -412, message: 'x' }).stage, 'api');
-    assert.strictEqual(parseHtml5Response(null).ok, false);
-  });
-  test('playurl: dimsForQn', () => {
-    assert.deepStrictEqual(dimsForQn(32), { width: 640, height: 360 });
-    assert.deepStrictEqual(dimsForQn(16), { width: 640, height: 360 });
-    assert.deepStrictEqual(dimsForQn(64), { width: 1280, height: 720 });
-  });
-
   // ---------------- player adapter ----------------
+
   test('player: buildOpenArgs 顺序与钳制（16 个位置参数，含 DASH 第二输入 / fpsCap / isLive）', () => {
     const args = buildOpenArgs({
       input: 'https://x/v.mp4',
@@ -757,6 +273,7 @@ async function main() {
     assert.strictEqual(buildOpenArgs({ input: 'a', fpsCap: 'x' })[14], 0);
     assert.strictEqual(buildOpenArgs({ input: 'a', fpsCap: 29.6 })[14], 30);
   });
+
   test('player: isSafeInput 拒绝空白/../超长/非 http(s)', () => {
     assert.strictEqual(isSafeInput('https://x/v.mp4'), true);
     assert.strictEqual(isSafeInput('/abs/path.mp4'), true);
@@ -766,32 +283,36 @@ async function main() {
     assert.strictEqual(isSafeInput('ftp://x/v'), false);
     assert.strictEqual(isSafeInput(123), false);
   });
+
   test('player: UA/Referer 校验与 native 规则一致', () => {
-    assert.strictEqual(isSafeUserAgent(DEFAULT_UA), true);
+    assert.strictEqual(isSafeUserAgent(TEST_UA), true);
     assert.strictEqual(isSafeUserAgent(''), true);
     assert.strictEqual(isSafeUserAgent(null), true);
     assert.strictEqual(isSafeUserAgent('a'.repeat(256)), false);
     assert.strictEqual(isSafeUserAgent('bad\u0007ua'), false);
     assert.strictEqual(isSafeUserAgent('非ascii夏'), false);
-    assert.strictEqual(isSafeReferer('https://www.bilibili.com/'), true);
+    assert.strictEqual(isSafeReferer('https://www.douyu.com/'), true);
     assert.strictEqual(isSafeReferer('https://a b/'), false);
     assert.strictEqual(isSafeReferer('x'.repeat(513)), false);
     assert.strictEqual(isSafeReferer(''), true);
   });
+
   test('player: 模块缺失 → PLAYER_NATIVE_MISSING（预期 fallback）', async () => {
     resetPlayerModuleCache();
     assert.strictEqual(await hasModule(), false);
     const r = await openSession({
       input: 'https://x/v.mp4',
       rect: { x: 0, y: 0, width: 2, height: 2 },
-      userAgent: DEFAULT_UA
+      userAgent: TEST_UA
     });
     assert.strictEqual(r.ok, false);
     assert.strictEqual(r.code, 'PLAYER_NATIVE_MISSING');
   });
+
   test('player: describeError 收录 PLAYER_BAD_HEADERS', () => {
     assert.ok(describeError('PLAYER_BAD_HEADERS').indexOf('请求头') >= 0);
   });
+
   test('player: v1/v2 开关归一化（非法值一律当未指定）', async () => {
     const P = await import('../src/services/player.js');
     assert.strictEqual(P.normalizeImpl('v1'), 'v1');
@@ -802,8 +323,9 @@ async function main() {
     assert.strictEqual(P.normalizeImpl(1), '');
     // 缺省实现是 v2（新模块）；storage 键名是与运维约定的硬契约
     assert.strictEqual(P.PLAYER_IMPL_DEFAULT, 'v2');
-    assert.strictEqual(P.PLAYER_IMPL_KEY, 'bili_player_impl');
+    assert.strictEqual(P.PLAYER_IMPL_KEY, 'douyu_player_impl');
   });
+
   test('player: setPlayerImpl 切换后丢弃已加载模块（下次调用重新加载）', async () => {
     const P = await import('../src/services/player.js');
     P.resetPlayerModuleCache();
@@ -817,6 +339,7 @@ async function main() {
     assert.strictEqual(P.getPlayerImpl(), 'v2');
     P.resetPlayerModuleCache();
   });
+
   test('player: recover() 在无 native 模块时返回 PLAYER_NATIVE_MISSING（不抛）', async () => {
     const P = await import('../src/services/player.js');
     P.resetPlayerModuleCache();
@@ -824,6 +347,7 @@ async function main() {
     assert.strictEqual(r.ok, false);
     assert.ok(r.code === 'PLAYER_NATIVE_MISSING' || r.code === 'PLAYER_UNSUPPORTED');
   });
+
   test('player: v2 专有可选接口缺失 → PLAYER_UNSUPPORTED（页面可降级）', async () => {
     const P = await import('../src/services/player.js');
     P.resetPlayerModuleCache();
@@ -836,12 +360,14 @@ async function main() {
   });
 
   // ---------------- screen ----------------
+
   test('screen: 360p 视频区矩形（X6 Pro 逻辑 960x266 / 物理 266x960）', () => {
     const r = probeVideoRects(640, 360);
     assert.deepStrictEqual(r.logical, { x: 234, y: 0, width: 427, height: 240 });
     assert.deepStrictEqual(r.physical, { x: 0, y: 299, width: 240, height: 427 });
     assert.strictEqual(isRectInsidePanel(r.physical), true);
   });
+
   test('screen: fitLogicalRect 信箱适配', () => {
     const r = fitLogicalRect(1920, 1080);
     assert.strictEqual(r.width, 473); // 960x266 box：16:9 按高适配 → 473x266
@@ -849,12 +375,14 @@ async function main() {
     const v = fitLogicalRect(360, 640); // 竖屏稿件
     assert.ok(v.width < v.height);
   });
+
   test('screen: direction=270 四角与越界钳制', () => {
     // X6 Pro 物理面板 266x960 ⇒ 270 转角：phys.x = 266-1-cy，phys.y = cx
     assert.deepStrictEqual(logicalToPhysicalPoint({ x: 0, y: 0 }, 270), { x: 265, y: 0 });
     assert.deepStrictEqual(logicalToPhysicalPoint({ x: 959, y: 0 }, 270), { x: 265, y: 959 });
     assert.deepStrictEqual(logicalToPhysicalPoint({ x: -5, y: 9999 }, 270), { x: 0, y: 0 });
   });
+
   test('screen: 越界/非法矩形被拒', () => {
     assert.strictEqual(isRectInsidePanel({ x: 260, y: 0, width: 10, height: 10 }), false); // 260+10 > 266
     assert.strictEqual(isRectInsidePanel({ x: -1, y: 0, width: 10, height: 10 }), false);
@@ -863,12 +391,14 @@ async function main() {
   });
 
   // ---- 屏幕保活（缺陷 C 修复）----
+
   test('screen: 保活周期必须 < 30s（hal-screen keep 只续 30s）', () => {
     assert.strictEqual(KEEP_INTERVAL_MS, 20000);
     assert.ok(KEEP_INTERVAL_MS < 30000, '周期必须小于 hal-screen keep 的 30s 续期窗口');
     // 必须挡住 570s 那一级调暗（113→5）：570s / 20s = 28 次续期，每次都把窗口推后
     assert.ok(570000 / KEEP_INTERVAL_MS >= 20);
   });
+
   test('screen: createScreenKeeper 定时续期 / stop 后不再调用', async () => {
     let calls = 0;
     const timers = [];
@@ -903,6 +433,7 @@ async function main() {
     timers[2] && timers[2]();
     assert.strictEqual(calls, 3);
   });
+
   test('screen: keeper immediate=false 不立刻续期', () => {
     let calls = 0;
     const keeper = createScreenKeeper({
@@ -917,6 +448,7 @@ async function main() {
     assert.strictEqual(calls, 0);
     keeper.stop();
   });
+
   test('screen: 无 brightness 模块时 keepScreenOnce 静默返回 false（不抛）', () => {
     // Node 环境没有 $falcon / brightness 模块：必须降级而不是崩
     assert.strictEqual(keepScreenOnce(), false);
@@ -924,6 +456,7 @@ async function main() {
     assert.strictEqual(getScreenState(), null);
     assert.strictEqual(isKeepingScreen(), false);
   });
+
   test('screen: getScreenState 编号语义（真机实测 0=ON 3=DIM 1=OFF）', () => {
     assert.strictEqual(screenStateName(0), 'ON');
     assert.strictEqual(screenStateName(3), 'DIM');
@@ -931,6 +464,7 @@ async function main() {
     assert.strictEqual(screenStateName(null), '未知');
     assert.strictEqual(screenStateName(7), '未知(7)');
   });
+
   test('screen: 硬兜底以 state 为主判据（getBrightness 被调暗时仍是 80）', () => {
     // 真机实证：hal-screen down 后 bl_br=5 / bl_power=0，但 getBrightness() 仍返回 80，
     // 所以只靠亮度会漏判 —— 必须靠 state 触发兜底。
@@ -946,6 +480,7 @@ async function main() {
     // 恢复档位必须高于阈值，否则兜底会陷入"救回来又被判为调暗"的循环
     assert.ok(KEEP_BRIGHT_RESTORE > KEEP_BRIGHT_MIN);
   });
+
   test('screen: 深熄态 keep 需连发两次（retry 判据）', () => {
     /* 真机实测（2026-11-01，hal-screen keep）：从 bp=4 背光断电状态，
      * 第 1 次 keep 只把 /tmp/.screen_state 置 1、bp 仍 4；第 2 次才 bp=0。
@@ -957,12 +492,14 @@ async function main() {
     assert.strictEqual(keepRetryNeeded(undefined), false);
     assert.strictEqual(keepRetryNeeded('1'), true, '字符串形态同样识别（JSAPI 可能回字符串）');
   });
+
   test('screen: 息屏超时档位落在 600~1200s（<1200 才不被 daemon 重置脚本清掉）', () => {
     // /usr/bin/check_stop_input_deamon_times.sh：/tmp/stop_input_event_daemon 超过 1200s 会
     // killall -USR2 input-event-daemon 把配置重置掉，所以设得比 1200 小才有意义。
     assert.ok(KEEP_CLOSE_SCREEN_SEC >= 600, '不能短于 10 分钟，否则退化成频繁调用');
     assert.ok(KEEP_CLOSE_SCREEN_SEC < 1200, '必须小于 daemon 重置阈值 1200s');
   });
+
   test('screen: 两次进出保活无定时器泄漏（start 幂等 / 计数按会话归零）', () => {
     // 真机踩过的坑：onHide 停保活后如果 keeper 没真停，日志里会出现两条 #N 序列交织。
     // 这里对单例直接断言：重复 start 不得叠第二套定时器，再次 start 计数必须归 0。
@@ -985,47 +522,8 @@ async function main() {
     assert.strictEqual(isKeepingScreen(), false);
   });
 
-  // ---- 进度条轨道几何（P1-14）----
-  test('screen: 进度条轨道 = 中列 469 − 2×8 padding', () => {
-    assert.strictEqual(SEEK_TRACK_WIDTH, 453);
-    assert.strictEqual(SEEK_FILL_MAX, 443);
-  });
-  test('screen: seekRatioFromX 钳制与非法输入', () => {
-    assert.strictEqual(seekRatioFromX(8), 0); // 左 padding 边界
-    assert.strictEqual(seekRatioFromX(461), 1); // 8 + 453
-    assert.strictEqual(seekRatioFromX(0), 0); // 越界左 → 钳到 0
-    assert.strictEqual(seekRatioFromX(600), 1); // 越界右 → 钳到 1
-    assert.strictEqual(seekRatioFromX(234.5), 0.5); // (234.5-8)/453
-    assert.strictEqual(seekRatioFromX(NaN), null);
-    assert.strictEqual(seekRatioFromX('abc'), null);
-    assert.strictEqual(seekRatioFromX(undefined), null);
-    // 自定义轨道宽（布局改了也能对上）
-    assert.strictEqual(seekRatioFromX(108, 200), 0.5);
-  });
-  test('screen: seekFillWidth 钳制与四舍五入', () => {
-    assert.strictEqual(seekFillWidth(0), 0);
-    assert.strictEqual(seekFillWidth(1), 443);
-    assert.strictEqual(seekFillWidth(0.5), 222); // round(443*0.5)=222（.5 进位）
-    assert.strictEqual(seekFillWidth(-1), 0);
-    assert.strictEqual(seekFillWidth(2), 443);
-    assert.strictEqual(seekFillWidth(NaN), 0);
-    assert.strictEqual(seekFillWidth(0.5, 100), 50);
-  });
+  // ---------------- storage 底层 ----------------
 
-  // ---------------- storage schema ----------------
-  test('storage: normalizeSession 版本/类型容错', () => {
-    assert.strictEqual(normalizeSession(null).buvid3, '');
-    assert.strictEqual(normalizeSession({ version: 99, buvid3: 'x' }).buvid3, '');
-    const s = normalizeSession({ version: 1, buvid3: 'B3', buvid4: 'B4', updatedAt: 5 });
-    assert.strictEqual(s.buvid3, 'B3');
-    assert.strictEqual(s.buvid4, 'B4');
-    assert.strictEqual(normalizeSession({ version: 1, buvid3: 123 }).buvid3, '');
-  });
-  test('storage: normalizeSettings 非法 bvid 回落默认', () => {
-    assert.strictEqual(normalizeSettings(null).bvid, DEFAULT_TARGET.bvid);
-    assert.strictEqual(normalizeSettings({ version: 1, bvid: 'bad id' }).bvid, DEFAULT_TARGET.bvid);
-    assert.strictEqual(normalizeSettings({ version: 1, bvid: 'BV1ZCeb6NEyM' }).bvid, 'BV1ZCeb6NEyM');
-  });
   test('storage: normalizeStoredValue 各形态', () => {
     assert.strictEqual(normalizeStoredValue({ data: 'x' }), 'x');
     assert.strictEqual(normalizeStoredValue({ value: 'y' }), 'y');
@@ -1034,134 +532,8 @@ async function main() {
     assert.strictEqual(normalizeStoredValue(null), '');
   });
 
-  // ---------------- probe 编排 ----------------
-  function fakeWorld(overrides) {
-    const events = [];
-    const calls = { open: 0, stop: 0, release: 0, status: 0 };
-    const world = {
-      events: events,
-      calls: calls,
-      openedWith: null,
-      player: {
-        hasModule: async () => true,
-        openSession: async (opts) => {
-          calls.open++;
-          world.openedWith = opts;
-          return { ok: true, state: 'playing', outWidth: 254, outHeight: 452, fps: 30 };
-        },
-        status: async () => {
-          calls.status++;
-          return { ok: true, state: 'playing', frames: 30 * calls.status, positionMs: 1000 * calls.status };
-        },
-        stop: async () => {
-          calls.stop++;
-          return { ok: true };
-        },
-        release: async () => {
-          calls.release++;
-          return { ok: true };
-        }
-      },
-      client: {
-        fetchWbiKeys: async () => ({ ok: true, code: -101, imgKey: '7'.repeat(32), subKey: '8'.repeat(32), ms: 10 }),
-        fetchFinger: async () => ({ ok: true, code: 0, buvid3: '3-abc', buvid4: '4-abc', ms: 5 }),
-        fetchView: async () => ({ ok: true, code: 0, cid: 42027451985, aid: 1, title: '测试标题', duration: 300, ms: 8 }),
-        fetchPlayurl: async () => ({
-          ok: true,
-          code: 0,
-          data: {
-            quality: 32,
-            durl: [{ url: 'https://upos-x.bilivideo.com/a/v.mp4?deadline=1&upsig=zz', length: 2 * 1048576 }],
-            accept_quality: [32, 16]
-          },
-          ms: 12
-        })
-      },
-      hasNet: () => true,
-      target: { bvid: 'BV1ZCeb6NEyM' },
-      mediaUa: DEFAULT_UA,
-      mediaReferer: REFERER,
-      nowSec: () => 1700000000,
-      sleep: async () => {},
-      onSession: (s) => {
-        world.session = s;
-      },
-      cancelled: () => false,
-      onStep: (u) => events.push(u)
-    };
-    if (overrides) Object.assign(world, overrides);
-    return world;
-  }
-
-  test('probe: 全链路通过（fake transport/player），UA/Referer 送达播放器', async () => {
-    const w = fakeWorld();
-    const r = await runProbe(w);
-    assert.strictEqual(r.ok, true);
-    assert.strictEqual(r.qn, 32);
-    assert.ok(r.frames > 0);
-    assert.strictEqual(w.calls.open, 1);
-    assert.strictEqual(w.openedWith.userAgent, DEFAULT_UA);
-    assert.strictEqual(w.openedWith.referer, REFERER);
-    assert.strictEqual(w.openedWith.rect.width, 240);
-    assert.strictEqual(w.openedWith.rect.height, 427);
-    const fails = w.events.filter((e) => e.state === 'fail');
-    assert.strictEqual(fails.length, 0, JSON.stringify(fails));
-    const okIds = w.events.filter((e) => e.state === 'ok').map((e) => e.id);
-    ['net', 'wbi', 'view', 'playurl', 'native', 'play', 'watch'].forEach((id) => {
-      assert.ok(okIds.indexOf(id) >= 0, 'missing ok: ' + id);
-    });
-    assert.strictEqual(w.session.buvid3, '3-abc');
-    // 日志卫生：步骤详情严禁出现签名 URL 片段
-    w.events.forEach((e) => {
-      assert.ok(!/upsig|deadline=/.test(e.detail || ''), 'detail leaks url: ' + e.detail);
-    });
-  });
-
-  test('probe: playurl 失败 → 后续 skip、failedId 正确、不碰播放器', async () => {
-    const w = fakeWorld({
-      client: {
-        fetchWbiKeys: async () => ({ ok: true, code: -101, imgKey: '7'.repeat(32), subKey: '8'.repeat(32), ms: 1 }),
-        fetchFinger: async () => ({ ok: false, stage: 'http', message: 'x' }),
-        fetchView: async () => ({ ok: true, code: 0, cid: 42, aid: 1, title: 't', duration: 10, ms: 1 }),
-        fetchPlayurl: async () => ({ ok: false, stage: 'api', code: -412, message: '风控(-412)：请求被拦截' })
-      }
-    });
-    const r = await runProbe(w);
-    assert.strictEqual(r.ok, false);
-    assert.strictEqual(r.failedId, 'playurl');
-    const byId = {};
-    w.events.forEach((e) => {
-      byId[e.id] = e;
-    });
-    assert.strictEqual(byId.finger.state, 'skip');
-    assert.strictEqual(byId.native.state, 'skip');
-    assert.strictEqual(byId.watch.state, 'skip');
-    assert.strictEqual(w.calls.open, 0);
-  });
-
-  test('probe: 取消后不再回调 onStep，且已拉起的播放被停掉', async () => {
-    let cancelled = false;
-    const w = fakeWorld();
-    w.sleep = async () => {
-      cancelled = true; // watch 第一次回读时取消
-    };
-    w.cancelled = () => cancelled;
-    let count = 0;
-    const inner = w.onStep;
-    w.onStep = (u) => {
-      count++;
-      inner(u);
-    };
-    const r = await runProbe(w);
-    assert.strictEqual(r.cancelled, true);
-    const frozen = count;
-    await new Promise((res) => setImmediate(res));
-    assert.strictEqual(count, frozen);
-    assert.ok(w.calls.stop >= 1);
-    assert.ok(w.calls.release >= 1);
-  });
-
   // ---------------- autotest 种子守卫（防止普通用户被自动播放打扰） ----------------
+
   test('autotest: 只有 enabled+autotest 双开关都显式 true 才自动播', () => {
     // 正例：唯一合法的开启形态
     assert.strictEqual(isAutotestSeedEnabled({ enabled: true, autotest: true }), true);
@@ -1190,831 +562,190 @@ async function main() {
   });
 
   test('autotest: readAutotestSeed 对脏值退化（不因一个脏字段触发意外行为）', () => {
+    // v2.0.0 纯斗鱼版只剩三个纯诊断开关（都不取流、不播放、不亮屏）
     const empty = readAutotestSeed(null);
-    assert.strictEqual(empty.soak, 0);
-    assert.strictEqual(empty.soakBv, '', '无种子 → 不指定稿件');
-    assert.strictEqual(empty.playProbe, 0, 'playProbe=0 → 不跑起播探针');
     assert.strictEqual(empty.pollEvery, 5, '默认 5s');
-    assert.strictEqual(empty.liveOnly, false);
     assert.strictEqual(empty.noKeep, false);
-    assert.strictEqual(empty.probeRect, false);
-
-    // soakBv 形态不对 → 当作没指定（脏值绝不能被拼进请求 URL）
-    const badBv = readAutotestSeed({ enabled: true, autotest: true, soakBv: 'javascript:alert(1)' });
-    assert.strictEqual(badBv.soakBv, '');
-    assert.strictEqual(readAutotestSeed({ enabled: true, autotest: true, soakBv: 'BV123' }).soakBv, '');
+    assert.strictEqual(empty.probeLiveEnd, false);
+    assert.deepStrictEqual(
+      Object.keys(readAutotestSeed({ enabled: true, autotest: true })),
+      ['pollEvery', 'noKeep', 'probeLiveEnd'],
+      '导出字段面必须只剩这三项 —— 点播探针已随功能删除'
+    );
 
     // 正常种子逐字段还原
     const s = readAutotestSeed({
-      version: 1, enabled: true, autotest: true, playProbe: 150, pollEvery: 2,
-      soak: 60, soakBv: 'BV1SDJC6dE4t', liveOnly: false, liveRoom: 0,
-      wbiStress: 0, liveHold: 15000, noKeep: true, probeSeek: 3, probePause: 2, probeRect: true
+      version: 1, enabled: true, autotest: true, pollEvery: 2,
+      noKeep: true, probeLiveEnd: true
     });
-    assert.strictEqual(s.playProbe, 150);
     assert.strictEqual(s.pollEvery, 2);
-    assert.strictEqual(s.soak, 60);
-    assert.strictEqual(s.soakBv, 'BV1SDJC6dE4t');
-    assert.strictEqual(s.liveHold, 15000);
     assert.strictEqual(s.noKeep, true);
-    assert.strictEqual(s.probeSeek, 3);
-    assert.strictEqual(s.probePause, 2);
-    assert.strictEqual(s.probeRect, true);
+    assert.strictEqual(s.probeLiveEnd, true);
+
+    // 严格布尔：字符串 'true' / 1 都不认
+    assert.strictEqual(readAutotestSeed({ enabled: true, autotest: true, noKeep: 'true' }).noKeep, false);
+    assert.strictEqual(readAutotestSeed({ enabled: true, autotest: true, probeLiveEnd: 1 }).probeLiveEnd, false);
+
     // pollEvery 下界 1（诊断时要能设 1s）
     assert.strictEqual(readAutotestSeed({ enabled: true, autotest: true, pollEvery: 0 }).pollEvery, 5);
     assert.strictEqual(readAutotestSeed({ enabled: true, autotest: true, pollEvery: 1 }).pollEvery, 1);
     assert.strictEqual(readAutotestSeed({ enabled: true, autotest: true, pollEvery: -3 }).pollEvery, 5);
+    assert.strictEqual(readAutotestSeed({ enabled: true, autotest: true, pollEvery: 'abc' }).pollEvery, 5);
   });
 
-  test('probe: watch 无帧 → failedId=watch 且停掉播放', async () => {    const w = fakeWorld();
-    w.player.status = async () => ({ ok: true, state: 'playing', frames: 0, positionMs: 0 });
-    const r = await runProbe(w);
-    assert.strictEqual(r.ok, false);
-    assert.strictEqual(r.failedId, 'watch');
-    assert.ok(w.calls.stop >= 1);
-    assert.ok(w.calls.release >= 1);
+
+  // ---------------- 斗鱼服务层（纯函数，离线可跑） ----------------
+
+  // 联网行为在 test/douyu_feed_test.js（真打端点）；这里只钉死契约与纯逻辑。
+
+  test('douyu/api: 签名链路与 node crypto 对拍（doc §1 的 md5 循环）', () => {
+    const key = 'abcdefghijklmnopqrstuvwxyz';
+    // f = rand_str；循环 enc_time 次 f = md5(f + key)
+    assert.strictEqual(douyuApi.deriveSigningKey('0123456789abcdef', key, 1), nodeMd5('0123456789abcdef' + key));
+    assert.strictEqual(douyuApi.deriveSigningKey('r', key, 0), 'r', 'enc_time=0 时原样返回');
+    let want = 'r';
+    for (let i = 0; i < 3; i++) want = nodeMd5(want + key);
+    assert.strictEqual(douyuApi.deriveSigningKey('r', key, 3), want, '每次循环必须喂上一次的结果');
+    // auth = md5(f + key + String(rid) + String(ts))，ts 秒级、拼接顺序不能换
+    assert.strictEqual(douyuApi.buildAuth('F', 'K', 9, 1700000000), nodeMd5('FK' + '9' + '1700000000'));
   });
 
-  test('probe: net 通道缺失立即失败', async () => {
-    const w = fakeWorld({ hasNet: () => false });
-    const r = await runProbe(w);
-    assert.strictEqual(r.failedId, 'net');
-    assert.strictEqual(w.calls.open, 0);
-  });
-
-  test('probe: STEPS label 唯一（面板渲染依赖）', () => {
-    assert.ok(STEPS.length >= 8);
-    const labels = STEPS.map((s) => s.label);
-    assert.strictEqual(new Set(labels).size, labels.length);
-    STEPS.forEach((s) => assert.ok(s.id && s.label));
-  });
-
-  // ---------------- feed（fixtures = 开发机真响应裁剪）----------------
-  test('feed: normalizeCover 协议归一 + hdslb → archive.biliimg.com（X6 Pro 设备 DNS 实测）', () => {
-    // 设备上 i*.hdslb.com 无法解析，archive.biliimg.com 提供同 path 的图片
-    assert.strictEqual(normalizeCover('//i0.hdslb.com/a.jpg'), 'http://archive.biliimg.com/a.jpg');
-    assert.strictEqual(normalizeCover('https://i1.hdslb.com/b.jpg'), 'http://archive.biliimg.com/b.jpg');
-    assert.strictEqual(normalizeCover('http://i1.hdslb.com/c.jpg'), 'http://archive.biliimg.com/c.jpg');
-    assert.strictEqual(normalizeCover('//i2.hdslb.com:8080/d.jpg'), 'http://archive.biliimg.com/d.jpg');
-    assert.strictEqual(normalizeCover('https://example.org/x.png'), 'https://example.org/x.png');
-    assert.strictEqual(normalizeCover('https://archive.biliimg.com/bfs/archive/y.jpg'), 'https://archive.biliimg.com/bfs/archive/y.jpg');
-    assert.strictEqual(normalizeCover(''), '');
-  });
-  test('feed: formatDuration / formatCount', () => {
-    assert.strictEqual(formatDuration(0), '');
-    assert.strictEqual(formatDuration(65), '01:05');
-    assert.strictEqual(formatDuration(3671), '1:01:11');
-    assert.strictEqual(formatCount(0), '');
-    assert.strictEqual(formatCount(9999), '9999');
-    assert.strictEqual(formatCount(12345), '1.2万');
-    assert.strictEqual(formatCount(123456789), '1.2亿');
-  });
-  test('feed: rcmd fixture → ≥10 条合规视频（bvid/标题/cover 归一）', () => {
-    const fx = fixture('rcmd.json');
-    const items = [];
-    fx.data.item.forEach((raw) => {
-      const it = normalizeVideo(raw, 'rcmd');
-      if (it) items.push(it);
-    });
-    // fixture 为真响应裁剪（保留 12 条），断言按裁剪量
-    assert.ok(items.length >= 10, 'n=' + items.length);
-    items.forEach((it) => {
-      assert.ok(/^BV[0-9A-Za-z]{10}$/.test(it.bvid));
-      assert.ok(it.title.length > 0);
-      assert.ok(!(it.cover.indexOf('https://') === 0 && it.cover.indexOf('hdslb') >= 0), 'hdslb 不应为 https: ' + it.cover);
-      assert.ok(it.cover.indexOf('hdslb.com') < 0, '设备上 hdslb 不可解析，必须换 CDN: ' + it.cover);
-    });
-  });
-  test('feed: popular fixture + 非法条目丢弃', () => {
-    const fx = fixture('popular.json');
-    const good = fx.data.list.map((x) => normalizeVideo(x, 'hot')).filter(Boolean);
-    assert.ok(good.length >= 10, 'n=' + good.length);
-    assert.strictEqual(normalizeVideo({ bvid: 'bad' }, 'x'), null);
-    assert.strictEqual(normalizeVideo(null), null);
-  });
-  test('feed: search normalize（剥 HTML / 时长解析 / 直播卡滤除）', () => {
-    const s = normalizeSearch({
-      bvid: 'BV15Eec6UERy',
-      title: '<em class="keyword">测试</em>视频',
-      author: 'UP主',
-      pic: '//i1.hdslb.com/bfs/archive/x.jpg',
-      duration: '59:39',
-      play: 12345
-    });
-    assert.ok(s);
-    assert.strictEqual(s.kind, 'video');
-    assert.strictEqual(s.title, '测试视频');
-    assert.strictEqual(s.up, 'UP主');
-    assert.strictEqual(s.durationSec, 3579);
-    assert.strictEqual(s.view, 12345);
-    assert.strictEqual(s.cover, 'http://archive.biliimg.com/bfs/archive/x.jpg');
-    assert.strictEqual(s.cid, 0, '搜索无 cid，靠播放链无条件 view 补齐');
-    assert.strictEqual(s.source, 'search');
-    // 直播卡（带 roomid）直接滤除
-    assert.strictEqual(normalizeSearch({ bvid: 'BV1ZCeb6NEyM', roomid: 123 }), null);
-    // 实体 / 多段时长 / 与 formatDuration 互逆
-    assert.strictEqual(stripHtml('A&amp;B'), 'A&B');
-    assert.strictEqual(parseDuration('1:02:03'), 3723);
-    assert.strictEqual(parseDuration(90), 90);
-    assert.strictEqual(parseDuration('bad'), 0);
-    assert.strictEqual(formatDuration(parseDuration('59:39')), '59:39');
-    assert.strictEqual(formatDuration(parseDuration('1:02:03')), '1:02:03');
-  });
-  test('feed: fetchRecommended 注入 transport（不碰网络，URL+ps 断言）', async () => {
-    const fx = fixture('rcmd.json');
-    let seenUrl = '';
-    const c = createClient({
-      get: async (u) => {
-        seenUrl = u;
-        return { statusCode: 200, body: JSON.stringify(fx) };
-      }
-    });
-    const r = await fetchRecommended(c);
-    assert.strictEqual(r.ok, true);
-    // fixture 为真响应裁剪（12 条）
-    assert.ok(r.items.length >= 10, 'n=' + r.items.length);
-    assert.ok(seenUrl.indexOf('/x/web-interface/index/top/feed/rcmd') > 0, seenUrl);
-    assert.ok(seenUrl.indexOf('ps=' + RCMD_PAGE_SIZE) > 0, seenUrl);
-    assert.strictEqual(r.noMore, true);
-  });
-  test('feed: searchVideos 全链（WBI 签名 URL + fixture 解析 + 参数防御）', async () => {
-    const fx = fixture('search.json');
-    let seenUrl = '';
-    const c = createClient({
-      get: async (u) => {
-        seenUrl = u;
-        return { statusCode: 200, body: JSON.stringify(fx) };
-      }
-    });
-    const r = await searchVideos(c, 'a'.repeat(32), '测试', 1);
-    assert.strictEqual(r.ok, true, r.message);
-    assert.ok(r.items.length >= 5, 'n=' + r.items.length);
-    assert.ok(seenUrl.indexOf('/x/web-interface/wbi/search/type') > 0, seenUrl);
-    assert.ok(seenUrl.indexOf('w_rid=') > 0, seenUrl);
-    assert.ok(seenUrl.indexOf('keyword=') > 0, seenUrl);
-    r.items.forEach((it) => {
-      assert.strictEqual(it.kind, 'video');
-      assert.ok(/^BV[0-9A-Za-z]{10}$/.test(it.bvid));
-      assert.ok(it.title.indexOf('<') < 0, it.title);
-    });
-    // 参数防御：mixinKey 非法 / 空关键词
-    assert.strictEqual((await searchVideos(c, 'short', 'x', 1)).ok, false);
-    assert.strictEqual((await searchVideos(c, 'a'.repeat(32), '  ', 1)).ok, false);
-    // 分页越界语义由 numPages 决定（fixture numPages>=1 → page1 不是最后页）
-    if (r.noMore === false) assert.ok(r.page === 1);
-  });
-  test('feed: fetchPopular no_more 语义 + 空列表即无更多', async () => {
-    const fx = fixture('popular.json');
-    const c1 = createClient({ get: async () => ({ statusCode: 200, body: JSON.stringify(fx) }) });
-    const r1 = await fetchPopular(c1, 1);
-    assert.strictEqual(r1.ok, true);
-    assert.strictEqual(r1.noMore, false); // fixture 未带 no_more → 还能翻
-    const c2 = createClient({
-      get: async () => ({ statusCode: 200, body: '{"code":0,"data":{"list":[],"no_more":true}}' })
-    });
-    const r2 = await fetchPopular(c2, 3);
-    assert.strictEqual(r2.ok, true);
-    assert.strictEqual(r2.noMore, true);
-  });
-  test('feed: describeListError 四段文案', () => {
-    assert.strictEqual(describeListError({ ok: false, stage: 'transport', message: 'NET_TIMEOUT: x' }).indexOf('网络失败'), 0);
-    assert.ok(describeListError({ ok: false, stage: 'api', code: -352, message: '风控' }).indexOf('-352') >= 0);
-    assert.strictEqual(describeListError({ ok: true }), '');
-  });
-  test('feed: describeListError wbi 段可读（不再是 code=?）', () => {
-    const s = describeListError({ ok: false, stage: 'wbi', message: 'nav 缺少 wbi_img 字段' });
-    assert.strictEqual(s.indexOf('签名密钥获取失败'), 0);
-    assert.ok(s.indexOf('nav 缺少 wbi_img 字段') >= 0);
-  });
-  test('feed: appendDeduped 去重 + 封顶', () => {
-    const a = [{ bvid: 'BV1ZCeb6NEyM' }, { bvid: 'BVaaaaaaaaaa' }];
-    const b = [{ bvid: 'BVaaaaaaaaaa' }, { bvid: 'BVbbbbbbbbbb' }];
-    const r = appendDeduped(a, b);
-    assert.strictEqual(r.added, 1);
-    assert.strictEqual(r.items.length, 3);
-    assert.strictEqual(r.capped, false);
-    const big = [];
-    for (let i = 0; i < MAX_ITEMS + 5; i++) big.push({ bvid: 'BV' + String(10000000000 + i) });
-    const capped = appendDeduped([], big);
-    assert.strictEqual(capped.capped, true);
-    assert.strictEqual(capped.items.length, MAX_ITEMS);
-  });
-  test('feed: appendDeduped 按 key 跨类型去重（v:/a:/l: 前缀不互相顶掉）', () => {
-    const a = [{ key: 'v:BV1ZCeb6NEyM', bvid: 'BV1ZCeb6NEyM', kind: 'video' }];
-    const b = [
-      { key: 'v:BV1ZCeb6NEyM', bvid: 'BV1ZCeb6NEyM', kind: 'video' }, // 重复 → 丢
-      { key: 'a:117278561535782', id: 117278561535782, kind: 'article' },
-      { key: 'l:88', roomid: 88, kind: 'live' }
+  test('douyu/api: buildPlayUrl 参数齐全且 ver/iar 锁死（doc §1 一个字节都不能改）', () => {
+    const enc = { did: 'a'.repeat(32), enc_data: 'x y/z', key: 'K', f: 'F' };
+    const url = douyuApi.buildPlayUrl(9, 2, enc, 1700000000);
+    assert.strictEqual(url.indexOf(douyuApi.DOUYU_HOST + '/lapi/live/getH5PlayV1/9?'), 0);
+    const must = [
+      'tt=1700000000',
+      'auth=' + douyuApi.buildAuth('F', 'K', 9, 1700000000),
+      'cdn=',
+      'rate=2',
+      'ver=Douyu_224011102',
+      'iar=0',
+      'ive=0',
+      'prev=1',
+      'bs=2'
     ];
-    const r = appendDeduped(a, b);
-    assert.strictEqual(r.added, 2);
-    assert.strictEqual(r.items.length, 3);
-    assert.deepStrictEqual(r.items.map((x) => x.kind), ['video', 'article', 'live']);
+    const query = url.slice(url.indexOf('?') + 1).split('&');
+    for (const kv of must) assert.ok(query.indexOf(kv) >= 0, '缺参数 ' + kv);
+    // did / enc_data 必须 encodeURIComponent（enc_data 里有空格与斜杠）
+    assert.ok(query.indexOf('did=' + encodeURIComponent(enc.did)) >= 0);
+    assert.ok(query.indexOf('enc_data=x%20y%2Fz') >= 0);
+    // 硬约束：ver 与 iar 是签名之外的两个开关，改了就 403 或升档
+    assert.strictEqual(douyuApi.PLAY_VER, 'Douyu_224011102');
+    assert.strictEqual(douyuApi.DEFAULT_RATE, 2, 'doc §3：默认高清 900kbps');
   });
 
-  /* ---------------- 搜索三分栏：图文（专栏）与直播条目归一化 ---------------- */
-  // 结果卡片字段来自 2026-10-04 真机探针（tools/probe_search.mjs）：
-  //   图文卡 search_type=article → { id/aid, title(<em>), image_urls[]（无 pic）, author, view, reply }
-  //   直播卡 search_type=live  → { roomid, title(<em>), cover/user_cover, uname, online, cate_name }
-  test('feed: normalizeSearchArticle 字段映射（封面取 image_urls[0]，无 pic 字段）', () => {
-    const it = normalizeSearchArticle({
-      id: 117278561535782,
-      title: '【<em class="keyword">测试</em>】专栏标题',
-      image_urls: ['//i0.hdslb.com/bfs/article/cover.jpg'],
-      author: '作者甲',
-      desc: '摘要',
-      view: 4321,
-      reply: 12
-    });
-    assert.strictEqual(it.kind, 'article');
-    assert.strictEqual(it.key, 'a:117278561535782');
-    assert.strictEqual(it.id, 117278561535782);
-    assert.strictEqual(it.title, '【测试】专栏标题');
-    assert.strictEqual(it.cover, 'http://archive.biliimg.com/bfs/article/cover.jpg');
-    assert.strictEqual(it.up, '作者甲');
-    assert.strictEqual(it.view, 4321);
-    assert.strictEqual(it.reply, 12);
-    assert.strictEqual(it.source, 'search');
-    // 无封面 → cover 空串（不抛）；无 aid/id → null
-    assert.strictEqual(normalizeSearchArticle({ id: 7, title: 'a' }).cover, '');
-    assert.strictEqual(normalizeSearchArticle({ title: 'x' }), null);
-    assert.strictEqual(normalizeSearchArticle(null), null);
-  });
-  test('feed: normalizeSearchLive 字段映射（cover/user_cover 兜底）', () => {
-    const it = normalizeSearchLive({
-      roomid: 88,
-      title: '<em>直播</em>间',
-      cover: '//i0.hdslb.com/live.jpg',
-      uname: '主播乙',
-      online: 9,
-      cate_name: '网游'
-    });
-    assert.strictEqual(it.kind, 'live');
-    assert.strictEqual(it.key, 'l:88');
-    assert.strictEqual(it.roomid, 88);
-    assert.strictEqual(it.title, '直播间');
-    assert.strictEqual(it.up, '主播乙');
-    assert.strictEqual(it.online, 9);
-    assert.strictEqual(it.cate, '网游');
-    assert.strictEqual(normalizeSearchLive({ cover: 'x' }), null); // 无 roomid
-    assert.strictEqual(normalizeSearchLive(null), null);
-  });
-  test('feed: searchBili(article) 全链（search_type=article + WBI 签名 + 解析）', async () => {
-    let seenUrl = '';
-    const body = JSON.stringify({
-      code: 0,
-      data: {
-        result: [{ id: 999, title: '专栏A', image_urls: ['//i0.hdslb.com/a.jpg'], author: 'up', view: 5, reply: 1 }],
-        numPages: 3,
-        numResults: 40
-      }
-    });
-    const c = createClient({
-      get: async (u) => {
-        seenUrl = u;
-        return { statusCode: 200, body: body };
-      }
-    });
-    const r = await searchBili(c, 'a'.repeat(32), '图文', 1, 'article');
-    assert.strictEqual(r.ok, true, r.message);
-    assert.ok(seenUrl.indexOf('/x/web-interface/wbi/search/type') > 0, seenUrl);
-    assert.ok(seenUrl.indexOf('search_type=article') > 0, seenUrl);
-    assert.ok(seenUrl.indexOf('w_rid=') > 0, seenUrl);
-    assert.strictEqual(r.items.length, 1);
-    assert.strictEqual(r.items[0].kind, 'article');
-    assert.strictEqual(r.items[0].id, 999);
-    assert.strictEqual(r.noMore, false);
-    assert.strictEqual(r.total, 40);
-    // 缺 id 的卡片被丢弃 → 全丢时返回 parse 失败（区分"无结果"与"没有更多"）
-    const c2 = createClient({
-      get: async () => ({ statusCode: 200, body: '{"code":0,"data":{"result":[{"title":"x"}],"numPages":1}}' })
-    });
-    const r2 = await searchBili(c2, 'a'.repeat(32), 'kw', 1, 'article');
-    assert.strictEqual(r2.ok, false);
-    assert.strictEqual(r2.stage, 'parse');
-  });
-  test('feed: searchBili 默认回落 video；search_type/参数防御', async () => {
-    let seenUrl = '';
-    const c = createClient({
-      get: async (u) => {
-        seenUrl = u;
-        return { statusCode: 200, body: JSON.stringify(fixture('search.json')) };
-      }
-    });
-    const r = await searchBili(c, 'a'.repeat(32), '测试', 1); // 未传 searchType
-    assert.strictEqual(r.ok, true, r.message);
-    assert.ok(seenUrl.indexOf('search_type=video') > 0, seenUrl);
-    assert.ok(r.items.length >= 5);
-    r.items.forEach((it) => assert.strictEqual(it.kind, 'video'));
-    // 未知类型 → 回落 video（不把非法值透传给接口）
-    let seen2 = '';
-    const c2 = createClient({
-      get: async (u) => {
-        seen2 = u;
-        return { statusCode: 200, body: JSON.stringify(fixture('search.json')) };
-      }
-    });
-    await searchBili(c2, 'a'.repeat(32), 'kw', 1, 'bogus');
-    assert.ok(seen2.indexOf('search_type=video') > 0, seen2);
-    // 参数防御
-    assert.strictEqual((await searchBili(c, 'short', 'x', 1, 'video')).ok, false);
-    assert.strictEqual((await searchBili(c, 'a'.repeat(32), '   ', 1, 'video')).ok, false);
-  });
-  test('feed: searchBili(live) 支持 result 为分组对象（live_room）', async () => {
-    // 直播检索 result 不是数组而是按子类型分组的对象（2026-10-04 探针实测）
-    let seenUrl = '';
-    const body = JSON.stringify({
-      code: 0,
-      data: {
-        result: { live_room: [{ roomid: 5, title: '房', cover: '//i0.hdslb.com/l.jpg', uname: 'u', online: 3 }] },
-        numPages: 1
-      }
-    });
-    const c = createClient({
-      get: async (u) => {
-        seenUrl = u;
-        return { statusCode: 200, body: body };
-      }
-    });
-    const r = await searchBili(c, 'a'.repeat(32), 'l', 1, 'live');
-    assert.strictEqual(r.ok, true, r.message);
-    assert.ok(seenUrl.indexOf('search_type=live') > 0, seenUrl);
-    assert.strictEqual(r.items.length, 1);
-    assert.strictEqual(r.items[0].kind, 'live');
-    assert.strictEqual(r.items[0].roomid, 5);
-    assert.strictEqual(r.noMore, true);
+  test('douyu/api: normalizeRates 丢私有字段并跳过脏条目', () => {
+    const out = douyuApi.normalizeRates([
+      { name: '高清', rate: 2, bit: 900, diamondFan: 1, highBit: 4000 },
+      { rate: 3, bit: 2000 },
+      null,
+      'x',
+      { name: 'no-rate' }
+    ]);
+    assert.deepStrictEqual(out, [
+      { name: '高清', rate: 2, bit: 900 },
+      { name: 'rate3', rate: 3, bit: 2000 }
+    ]);
+    assert.deepStrictEqual(douyuApi.normalizeRates(null), []);
+    assert.deepStrictEqual(douyuApi.normalizeRates('x'), []);
   });
 
-  /* ---------------- 图文详情（专栏正文三形态解析） ---------------- */
-  test('article: decodeEntities 数字/命名实体', () => {
-    assert.strictEqual(decodeEntities('a&amp;b&#39;c&nbsp;d&hellip;'), 'a&b\'c d…');
-    assert.strictEqual(decodeEntities(null), '');
-    assert.strictEqual(decodeEntities(undefined), '');
-  });
-  test('article: htmlToBlocks 文本/图片混排 + 段落切块 + <br> 软换行 + script 剔除', () => {
-    // 块级标签结束 = 段落硬边界 → 每段独立成块（与 opus/ops 主路径一致；
-    // 若合并成单块，.art-p 的 lines:30 会截断长正文）
-    const blocks = htmlToBlocks('<p>第一段</p><p>第二段</p><img src="//i0.hdslb.com/a.jpg"><p>第三段</p>', 120);
-    assert.strictEqual(blocks.length, 4);
-    assert.strictEqual(blocks[0].t, 'text');
-    assert.strictEqual(blocks[0].text, '第一段');
-    assert.strictEqual(blocks[1].t, 'text');
-    assert.strictEqual(blocks[1].text, '第二段');
-    assert.strictEqual(blocks[2].t, 'img');
-    assert.strictEqual(blocks[2].src, 'http://archive.biliimg.com/a.jpg');
-    assert.strictEqual(blocks[2].dw, 880); // 正文列宽 ART_W
-    assert.ok(blocks[2].dh > 0);
-    assert.strictEqual(blocks[3].t, 'text');
-    assert.strictEqual(blocks[3].text, '第三段');
-    // <br> 为段内软换行 → 同一块内空格续接（不切块）
-    const soft = htmlToBlocks('<p>甲<br>乙</p>', 120);
-    assert.strictEqual(soft.length, 1);
-    assert.strictEqual(soft[0].text, '甲 乙');
-    assert.strictEqual(htmlToBlocks('<script>var a=1</script><style>i{}</style>', 120).length, 0);
-    assert.strictEqual(htmlToBlocks('', 120).length, 0);
-    assert.strictEqual(htmlToBlocks(null, 120).length, 0);
-  });
-  test('article: opusToBlocks 富文本段（text.nodes 拼接 + pic 按原始比例算高）', () => {
-    const opus = {
-      content: {
-        paragraphs: [
-          { para_type: 1, text: { nodes: [{ word: { words: '标题' } }, { word: { words: '正文' } }] } },
-          { para_type: 2, pic: { pics: [{ url: '//i0.hdslb.com/p.jpg', width: 800, height: 400 }] } },
-          { para_type: 1, text: { nodes: [{ word: { words: '   ' } }] } } // 空白段丢弃
-        ]
-      }
+  test('douyu/normalize: 条目归一（封面/头像档位、人气文案、未开播标记）', () => {
+    const raw = {
+      rid: 1863767,
+      rn: '  王者荣耀  官方赛事 ',
+      nn: '王者荣耀官方赛事',
+      cid2: 181,
+      c2name: '王者荣耀',
+      ol: 536100,
+      av: 'avatar_v3/202507/abc',
+      rs16: 'https://rpic.douyucdn.cn/live-cover/roomCover/2025/08/01/x.jpg',
+      rs1: 'https://rpic.douyucdn.cn/live-cover/roomCover/2025/08/01/x_big.jpg'
     };
-    const b = opusToBlocks(opus);
-    assert.strictEqual(b.length, 2);
-    assert.strictEqual(b[0].t, 'text');
-    assert.strictEqual(b[0].text, '标题正文');
-    assert.strictEqual(b[1].t, 'img');
-    assert.strictEqual(b[1].src, 'http://archive.biliimg.com/p.jpg');
-    assert.strictEqual(b[1].dw, 880);
-    assert.strictEqual(b[1].dh, 440); // 880*400/800
-    assert.strictEqual(opusToBlocks(null).length, 0);
-    assert.strictEqual(opusToBlocks({}).length, 0);
+    const it = douyuNorm.normalizeRoom(raw);
+    assert.strictEqual(it.site, 'douyu');
+    assert.strictEqual(it.rid, 1863767);
+    assert.strictEqual(it.title, '王者荣耀 官方赛事', '多余空白压成一个空格');
+    assert.strictEqual(it.streamer, '王者荣耀官方赛事');
+    assert.strictEqual(it.category, '王者荣耀');
+    assert.strictEqual(it.online, 536100);
+    assert.strictEqual(it.onlineText, '53.6万');
+    assert.strictEqual(it.isLive, true, '契约恒为 true');
+    assert.strictEqual(it.offline, false);
+    // 默认 rs16；显式 rs1 才用大图（400x400 方形，布局不能按 16:9 摆）
+    assert.ok(it.cover.indexOf('/x.jpg') > 0, '默认 rs16：' + it.cover);
+    assert.ok(douyuNorm.normalizeRoom(raw, { size: 'rs1' }).cover.indexOf('/x_big.jpg') > 0);
+    // 图片协议一律降 http（设备 ImageLoader 基于 curl，没有 CA 库）
+    assert.strictEqual(it.cover.indexOf('http://'), 0, it.cover);
+    // 头像 av 是相对路径且无扩展名，必须按档位补后缀
+    assert.strictEqual(it.avatar, 'http://apic.douyucdn.cn/upload/avatar_v3/202507/abc_middle.jpg');
+    assert.ok(douyuNorm.normalizeAvatar('avatar_v3/x', 'big').indexOf('_big.jpg') > 0);
+    assert.strictEqual(douyuNorm.normalizeAvatar(''), '');
+    // 未开播：ol=0（实测这类房间取流必得 -15）
+    const off = douyuNorm.normalizeRoom({ rid: 2, rn: 't', nn: 'n', ol: 0 });
+    assert.strictEqual(off.offline, true);
+    assert.strictEqual(off.onlineText, '');
+    // rid 非法 → null，列表归一必须丢掉
+    assert.strictEqual(douyuNorm.normalizeRoom({ rid: 0, rn: 't' }), null);
+    assert.strictEqual(douyuNorm.normalizeRoom(null), null);
+    const list = douyuNorm.normalizeRoomList([{ rid: 1, rn: 'a', nn: 'a', ol: 5 }, { rid: -1 }, { rid: 3, rn: 'b', nn: 'b', ol: 7 }]);
+    assert.deepStrictEqual(list.map((x) => x.rid), [1, 3]);
+    assert.deepStrictEqual(douyuNorm.normalizeRoomList(null), []);
   });
-  test('article: opsToBlocks（type3 老版 Quill deltas：软换行合并 + 图块 + 卡片占位）', () => {
-    const b = opsToBlocks(
-      JSON.stringify({
-        ops: [
-          { insert: '第一段' },
-          { insert: '\n第二段' }, // 软换行 → 合并进上一文本块
-          { insert: { 'native-image': { url: '//i0.hdslb.com/n.png', width: 100, height: 100 } } },
-          { insert: { 'video-card': {} } }
-        ]
-      })
-    );
-    assert.strictEqual(b.length, 3);
-    assert.strictEqual(b[0].t, 'text');
-    assert.strictEqual(b[0].text, '第一段第二段');
-    assert.strictEqual(b[1].t, 'img');
-    assert.strictEqual(b[1].src, 'http://archive.biliimg.com/n.png');
-    assert.strictEqual(b[1].dh, 880); // 1:1 → 880 宽对应高
-    assert.strictEqual(b[2].t, 'text');
-    assert.strictEqual(b[2].text, '[视频卡片]');
-    assert.strictEqual(opsToBlocks('{bad json').length, 0);
-    assert.strictEqual(opsToBlocks('').length, 0);
-    assert.strictEqual(opsToBlocks(null).length, 0);
-  });
-  test('article: parseArticle 三形态优先级(opus>ops>html) + id/正文缺失语义', () => {
-    // opus 优先
-    const r1 = parseArticle({
-      ok: true,
-      data: {
-        id: 5,
-        title: 'T',
-        type: 3,
-        opus: { content: { paragraphs: [{ para_type: 1, text: { nodes: [{ word: { words: 'OPUS正文' } }] } }] } },
-        content: '{"ops":[{"insert":"OPS正文"}]}',
-        author: { name: 'A' },
-        stats: { view: 9, like: 2 },
-        words: 100
-      }
-    });
-    assert.strictEqual(r1.ok, true, r1.message);
-    assert.strictEqual(r1.article.aid, 5);
-    assert.strictEqual(r1.article.blocks[0].text, 'OPUS正文');
-    assert.strictEqual(r1.article.author, 'A');
-    assert.strictEqual(r1.article.read, 9);
-    assert.strictEqual(r1.article.like, 2);
-    assert.strictEqual(r1.article.words, 100);
-    // opus 为空 → type3 走 ops
-    const r2 = parseArticle({ ok: true, data: { id: 6, title: '', type: 3, content: '{"ops":[{"insert":"OPS"}]}' } });
-    assert.strictEqual(r2.article.blocks[0].text, 'OPS');
-    assert.strictEqual(r2.article.title, '未命名图文');
-    // type0 → HTML 兜底
-    const r3 = parseArticle({ ok: true, data: { id: 7, title: 'H', type: 0, content: '<p>HTML正文</p>' } });
-    assert.strictEqual(r3.article.blocks[0].text, 'HTML正文');
-    // 正文全空 → summary 兜底
-    const r4 = parseArticle({ ok: true, data: { id: 8, title: 's', summary: '摘要文本' } });
-    assert.strictEqual(r4.ok, true);
-    assert.strictEqual(r4.article.blocks[0].text, '摘要文本');
-    // 无 id → parse 失败；无正文且无 summary → parse 失败
-    assert.strictEqual(parseArticle({ ok: true, data: { title: 'x', content: '<p>y</p>' } }).ok, false);
-    assert.strictEqual(parseArticle({ ok: true, data: { id: 9, title: 'x' } }).ok, false);
-    // transport 失败透传 stage
-    const bad = parseArticle({ ok: false, stage: 'transport', message: 'net' });
-    assert.strictEqual(bad.ok, false);
-    assert.strictEqual(bad.stage, 'transport');
-    assert.strictEqual(parseArticle(null).ok, false);
-  });
-  test('article: fetchArticle 走 WBI 签名（id= + wts= + w_rid=）+ 参数防御', async () => {
-    let seenPath = '';
-    let seenQuery = '';
-    const fakeClient = {
-      getHeaders: () => ({ 'User-Agent': 'UA', Referer: 'R' }),
-      request: (path, query) => {
-        seenPath = path;
-        seenQuery = String(query);
-        return Promise.resolve({ ok: true, data: { id: 3, title: 'T', content: '<p>c</p>' } });
-      }
-    };
-    const r = await fetchArticle(fakeClient, 'a'.repeat(32), 3);
-    assert.strictEqual(r.ok, true, r.message);
-    assert.strictEqual(seenPath, '/x/article/view');
-    assert.ok(seenQuery.indexOf('id=3') >= 0, seenQuery);
-    assert.ok(seenQuery.indexOf('wts=') > 0, seenQuery);
-    assert.ok(seenQuery.indexOf('w_rid=') > 0, seenQuery);
-    assert.strictEqual(r.article.aid, 3);
-    // 参数防御：id 非法 / WBI 密钥非法 都不发请求
-    assert.strictEqual((await fetchArticle(fakeClient, 'a'.repeat(32), 0)).stage, 'param');
-    assert.strictEqual((await fetchArticle(fakeClient, 'a'.repeat(32), 'x')).stage, 'param');
-    assert.strictEqual((await fetchArticle(fakeClient, 'bad', 3)).stage, 'wbi');
-  });
-  // （live_playinfo.json fixture 保留作技术留档：直播已从 UI 移除，720p 软解不实时）
 
-  /* ---------------- 直播：本地直连取流（不再经服务端转码） ---------------- */
-  // 取流走 services/bili/live.js：getRoomPlayInfo → 选 http_stream/flv/avc → 完整直链。
-  // 播放侧（resolveLiveUrl）只消费 parsePlayInfo 的产物，不关心 CDN 细节。
-  test('live: buildPlayInfoQuery —— 房间号校验与固定参数集', () => {
-    assert.strictEqual(buildPlayInfoQuery(0), '');
-    assert.strictEqual(buildPlayInfoQuery(-1), '');
-    assert.strictEqual(buildPlayInfoQuery('x'), '');
-    const q = buildPlayInfoQuery(22908869);
-    assert.ok(q.indexOf('room_id=22908869') === 0, q);
-    // protocol/format/codec 三组都要覆盖 flv+ts+fmp4 与 avc+hevc，否则拿不到完整候选
-    assert.ok(q.indexOf('protocol=0,1') > 0, q);
-    assert.ok(q.indexOf('format=0,1,2') > 0, q);
-    assert.ok(q.indexOf('codec=0,1') > 0, q);
-    assert.ok(q.indexOf('ptype=8') > 0, q);
-    // 必须请求最低画质 qn=150（480p）：已登录时 qn=10000 会给 1080p60 原画，
-    // 而 mppvideodec rotation 让 1080p60 解码慢 2.89x → 真机「一秒一卡」
-    assert.ok(q.indexOf('qn=150') > 0, q);
-    assert.ok(q.indexOf('qn=10000') < 0, q);
-    // 小数房间号取整
-    assert.ok(buildPlayInfoQuery(88.9).indexOf('room_id=88') === 0);
-    // 「我的 → 直播 → 分辨率」可覆盖 qn；非法值（0/负/NaN）回落到 150
-    assert.ok(buildPlayInfoQuery(22908869, 250).indexOf('qn=250') > 0);
-    assert.ok(buildPlayInfoQuery(22908869, 10000).indexOf('qn=10000') > 0);
-    assert.ok(buildPlayInfoQuery(22908869, 0).indexOf('qn=150') > 0);
-    assert.ok(buildPlayInfoQuery(22908869, -5).indexOf('qn=150') > 0);
-    assert.ok(buildPlayInfoQuery(22908869, 'x').indexOf('qn=150') > 0);
-  });
-  test('live: unescapeExtra 反转 \\u0026（不反转则 CDN 403）', () => {
-    assert.strictEqual(unescapeExtra('a=1\\u0026b=2'), 'a=1&b=2');
-    assert.strictEqual(unescapeExtra('a=1\\u0026b=2\\u0026c=3'), 'a=1&b=2&c=3');
-    // 大小写变体与 &amp; 一并处理
-    assert.strictEqual(unescapeExtra('a=1\\U0026b=2'), 'a=1&b=2');
-    assert.strictEqual(unescapeExtra('a=1&amp;b=2'), 'a=1&b=2');
-    assert.strictEqual(unescapeExtra('a=1&b=2'), 'a=1&b=2');
-    assert.strictEqual(unescapeExtra(''), '');
-    assert.strictEqual(unescapeExtra(null), '');
-  });
-  test('live: joinCodecUrl —— host + base_url + 反转后的 extra', () => {
-    const c = {
-      base_url: '/live-bvc/1/x.flv?',
-      url_info: [{ host: 'https://d1.bilivideo.com', extra: 'expires=1\\u0026qn=250' }]
-    };
-    assert.strictEqual(joinCodecUrl(c), 'https://d1.bilivideo.com/live-bvc/1/x.flv?expires=1&qn=250');
-    assert.strictEqual(joinCodecUrl({ base_url: '/a', url_info: [] }), '');
-    assert.strictEqual(joinCodecUrl({ base_url: '', url_info: [{ host: 'https://h' }] }), '');
-    assert.strictEqual(joinCodecUrl(null), '');
-  });
-  test('live: pickCodec —— flv/avc 优先，其次 flv/hevc，再次 ts/avc', () => {
-    const mk = (proto, fmt, codec, name) => ({
-      protocol_name: proto,
-      format: [{ format_name: fmt, codec: [{ codec_name: codec, current_qn: 250, base_url: '/' + name, url_info: [{ host: 'https://h', extra: 'q=1' }] }] }]
-    });
-    const streams = [
-      mk('http_hls', 'fmp4', 'hevc', 'fmp4hevc'),
-      mk('http_hls', 'ts', 'avc', 'tsavc'),
-      mk('http_stream', 'flv', 'hevc', 'flvhevc'),
-      mk('http_stream', 'flv', 'avc', 'flvavc')
-    ];
-    const r = pickCodec(streams);
-    assert.strictEqual(r.best.format, 'flv');
-    assert.strictEqual(r.best.codec, 'avc');
-    assert.ok(r.best.url.indexOf('flvavc') > 0, r.best.url);
-    assert.strictEqual(r.candidates.length, 4);
-    // 只有 hevc flv 时也能选出来（不硬性要求 avc）
-    const r2 = pickCodec([mk('http_stream', 'flv', 'hevc', 'onlyhevc')]);
-    assert.strictEqual(r2.best.codec, 'hevc');
-    // 空输入
-    assert.strictEqual(pickCodec([]).best, null);
-    assert.strictEqual(pickCodec(null).best, null);
-  });
-  test('live: parsePlayInfo —— 未开播 / 无流 / 正常（含 1280x720 真实分辨率）', () => {
-    // 未开播：live_status != 1
-    const off = parsePlayInfo({ ok: true, data: { live_status: 0 } });
-    assert.strictEqual(off.ok, false);
-    assert.strictEqual(off.stage, 'offline');
-    // 无 playurl_info
-    assert.strictEqual(parsePlayInfo({ ok: true, data: { live_status: 1 } }).stage, 'parse');
+  test('douyu/feed: 列表 URL 分段与关键词过滤', () => {
+    // 推荐恒走 0_0（实测 2_0 返回 code:0 + rl:[] 空列表）
     assert.strictEqual(
-      parsePlayInfo({ ok: true, data: { live_status: 1, playurl_info: { playurl: { stream: [] } } } }).stage,
-      'parse'
+      douyuFeed.buildMixListUrl(0, 1),
+      douyuApi.DOUYU_HOST + '/gapi/rkc/directory/mixList/0_0/1'
     );
-    // 接口失败原样透出
-    const bad = parsePlayInfo({ ok: false, stage: 'api', code: -352, message: '风控' });
-    assert.strictEqual(bad.ok, false);
-    assert.strictEqual(bad.code, -352);
-    // 正常
-    const good = parsePlayInfo({
-      ok: true,
-      data: {
-        live_status: 1,
-        playurl_info: {
-          playurl: {
-            stream: [{
-              protocol_name: 'http_stream',
-              format: [{
-                format_name: 'flv',
-                codec: [{
-                  codec_name: 'avc',
-                  current_qn: 250,
-                  media_info: { width: 1280, height: 720 },
-                  base_url: '/live-bvc/a.flv?',
-                  url_info: [{ host: 'https://d1.bilivideo.com', extra: 'expires=1\\u0026qn=250' }]
-                }]
-              }]
-            }]
-          }
-        }
-      }
-    });
-    assert.strictEqual(good.ok, true);
-    assert.strictEqual(good.qn, 250);
-    assert.strictEqual(good.width, 1280);
-    assert.strictEqual(good.height, 720);
-    assert.strictEqual(good.proto, 'http_stream');
-    assert.strictEqual(good.format, 'flv');
-    assert.strictEqual(good.codec, 'avc');
-    assert.strictEqual(good.url, 'https://d1.bilivideo.com/live-bvc/a.flv?expires=1&qn=250');
-    assert.ok(good.host.indexOf('bilivideo.com') > 0, good.host);
+    assert.strictEqual(
+      douyuFeed.buildMixListUrl(181, 3),
+      douyuApi.DOUYU_HOST + '/gapi/rkc/directory/mixList/2_181/3',
+      'cid1 恒为 2'
+    );
+    assert.ok(douyuFeed.buildMixListUrl(181, 0).indexOf('/2_181/1') > 0, '页码钳到 1');
+    assert.ok(douyuFeed.buildMixListUrl('x', 'y').indexOf('/0_0/1') > 0, '脏输入按推荐首页');
+    // 关键词匹配标题或主播名，大小写不敏感
+    const it = { title: 'Gemini：狼队 VS TTG', streamer: 'MrGemini' };
+    assert.strictEqual(douyuFeed.matchKeyword(it, 'gemini'), true);
+    assert.strictEqual(douyuFeed.matchKeyword(it, '狼队'), true);
+    assert.strictEqual(douyuFeed.matchKeyword(it, '原神'), false);
+    assert.strictEqual(douyuFeed.matchKeyword(null, 'x'), false);
+    assert.strictEqual(douyuFeed.matchKeyword(it, ''), false);
   });
-  test('live: parsePlayInfo 拒收非 https / 超长 / 含空白 的直链', () => {
-    const wrap = (url) => ({
-      ok: true,
-      data: {
-        live_status: 1,
-        playurl_info: {
-          playurl: {
-            stream: [{
-              protocol_name: 'http_stream',
-              format: [{ format_name: 'flv', codec: [{ codec_name: 'avc', base_url: url, url_info: [{ host: '', extra: '' }] }] }]
-            }]
-          }
-        }
-      }
+
+  test('douyu/cate: 分类树归一（cid2 保留 + 空分类剔除）', () => {
+    const out = douyuCate.normalizeCategories({
+      cateList: [
+        { id: 4, cn1: '网游竞技', list: [{ cid1: 4, cid2: 1, cn2: '英雄联盟' }, { cid1: 4, cid2: 181, cn2: '王者荣耀' }] },
+        { id: 9, cn1: '空分类', list: [] },
+        null
+      ]
     });
-    // host 为空 → joinCodecUrl 给空串 → 没有可用流
-    assert.strictEqual(parsePlayInfo(wrap('/x.flv')).stage, 'parse');
-  });
-  test('live: fetchLivePlayUrl —— 房间号非法不发请求；正常走绝对地址透传', async () => {
-    let seen = '';
-    const client = {
-      request: async (path, query) => {
-        seen = path + '?' + query;
-        return { ok: true, data: { live_status: 1, playurl_info: { playurl: { stream: [{
-          protocol_name: 'http_stream',
-          format: [{ format_name: 'flv', codec: [{
-            codec_name: 'avc', current_qn: 250, media_info: { width: 1280, height: 720 },
-            base_url: '/b.flv?', url_info: [{ host: 'https://d1.bilivideo.com', extra: 'e=1' }]
-          }] }]
-        }] } } } };
+    assert.deepStrictEqual(out, [
+      {
+        id: 4,
+        name: '网游竞技',
+        subs: [
+          { cid1: 4, cid2: 1, name: '英雄联盟' },
+          { cid1: 4, cid2: 181, name: '王者荣耀' }
+        ]
       }
-    };
-    assert.strictEqual((await fetchLivePlayUrl(client, 0)).stage, 'param');
-    assert.strictEqual(seen, '', '房间号非法时不得发请求');
-    const r = await fetchLivePlayUrl(client, 12345);
-    assert.strictEqual(r.ok, true);
-    assert.ok(seen.indexOf(LIVE_PLAYINFO_URL) === 0, seen);
-    assert.ok(seen.indexOf('room_id=12345') > 0, seen);
-  });
-  test('live: resolveLiveUrl —— 单输入直连（audioUrl 为空）+ durationMs=0 + 真实分辨率', async () => {
-    const mkClient = (data) => ({
-      request: async () => ({ ok: true, data })
-    });
-    const streams = [{
-      protocol_name: 'http_stream',
-      format: [{ format_name: 'flv', codec: [{
-        codec_name: 'avc', current_qn: 250, media_info: { width: 1280, height: 720 },
-        base_url: '/b.flv?', url_info: [{ host: 'https://d1.bilivideo.com', extra: 'e=1' }]
-      }] }]
-    }];
-    const ctx = { client: mkClient({ live_status: 1, playurl_info: { playurl: { stream: streams } } }) };
-    const r = await resolveLiveUrl(ctx, { kind: 'live', roomid: 9, title: 'T' });
-    assert.strictEqual(r.ok, true);
-    assert.strictEqual(r.live, true);
-    // v2（player2）起直播不再经 ffmpeg：FLV 绝对 PTS（≈792 小时）会让流式 matroskademux
-    // 永久 PREROLLING，改为 GStreamer 直连 souphttpsrc ! flvdemux。
-    // FLV 单流已含音轨，所以 audioUrl 必须为空 —— 回填 r.url 会让 native 开第二条连接。
-    assert.strictEqual(r.audioUrl, '');
-    assert.notStrictEqual(r.audioUrl, r.url);
-    assert.strictEqual(r.durationMs, 0);
-    assert.strictEqual(r.aid, 0);
-    assert.strictEqual(r.fps, LIVE_FPS_MOD);
-    assert.strictEqual(r.roomid, 9);
-    assert.strictEqual(r.qn, 250);
-    // 信箱比例必须按**源**分辨率算（硬解下 kmssink 做硬件缩放），不能写死 452x254
-    assert.strictEqual(r.width, 1280);
-    assert.strictEqual(r.height, 720);
-    // 未开播
-    const off = await resolveLiveUrl({ client: mkClient({ live_status: 0 }) }, { kind: 'live', roomid: 9 });
-    assert.strictEqual(off.ok, false);
-    assert.strictEqual(off.stage, 'offline');
-    assert.ok(describePlayError(off).length > 0);
-    // 房间号非法 → 不发请求
-    assert.strictEqual((await resolveLiveUrl({ client: mkClient({}) }, { kind: 'live', roomid: 0 })).stage, 'param');
+    ]);
+    assert.deepStrictEqual(douyuCate.normalizeCategories(null), []);
+    assert.deepStrictEqual(douyuCate.normalizeCategories({ cateList: 'x' }), []);
+    // 拼 URL 用的 cid1 与分类树里的 cid1 不是一回事，必须用常量 2
+    assert.strictEqual(douyuCate.MIX_CID1, 2);
   });
 
 
+  // ---------------- play_session（只播斗鱼直播） ----------------
 
-  // ---------------- reply 评论（读/写） ----------------
-  test('reply: fixture 全链读取（解析/分页/请求形态）', async () => {
-    const fx = fixture('reply.json');
-    let seenUrl = '';
-    const c = createClient({
-      get: async (u) => {
-        seenUrl = u;
-        return { statusCode: 200, body: JSON.stringify(fx) };
-      }
-    });
-    const r = await fetchReplies(c, 117320605239627, 1);
-    assert.strictEqual(r.ok, true, r.message);
-    assert.ok(r.items.length >= 1, 'n=' + r.items.length);
-    assert.strictEqual(r.count, 3319);
-    assert.strictEqual(r.pn, 1);
-    assert.strictEqual(r.noMore, false, '首页 size<size<count 不该到底');
-    assert.ok(seenUrl.indexOf('/x/v2/reply?') > 0, seenUrl);
-    assert.ok(seenUrl.indexOf('type=1') > 0);
-    assert.ok(seenUrl.indexOf('oid=117320605239627') > 0);
-    assert.ok(seenUrl.indexOf('sort=2') > 0);
-    const it = r.items[0];
-    assert.ok(it.rpid > 0 && it.name.length > 0 && it.message.length > 0);
-    assert.strictEqual(typeof it.likes, 'number');
-    assert.strictEqual(it.rcount, 7, 'fixture 首条 7 条回复');
-  });
-  test('reply: normalizeReply 边界 + parseReplies 失败透传', () => {
-    assert.strictEqual(normalizeReply(null), null);
-    assert.strictEqual(normalizeReply({}), null);
-    assert.strictEqual(normalizeReply({ rpid: 1, content: { message: '  ' } }), null);
-    const ok = normalizeReply({ rpid: 9, mid: 7, member: { uname: '甲' }, content: { message: '你好\n世界' }, like: 3, ctime: 1700000000 });
-    assert.strictEqual(ok.name, '甲');
-    assert.strictEqual(ok.message, '你好\n世界');
-    assert.strictEqual(ok.likes, 3);
-    assert.strictEqual(parseReplies({ ok: false, stage: 'transport', message: 'x' }).ok, false);
-    assert.strictEqual(parseReplies(null).ok, false);
-  });
-  test('reply: replyType 契约（1=视频 12=专栏；17 旧值回落 12）', () => {
-    assert.strictEqual(replyType(1), 1);
-    assert.strictEqual(replyType(12), 12);
-    assert.strictEqual(replyType(17), 12); // 17 为旧文档值（实测 -404）→ 收敛到 12
-    assert.strictEqual(replyType(undefined), 1);
-    assert.strictEqual(replyType(0), 1);
-    assert.strictEqual(replyType('12'), 1); // 非数字一律按视频回落
-  });
-  test('reply: fetchReplies 把 type 透传到请求（专栏 12 / 缺省视频 1）', async () => {
-    let seenUrl = '';
-    const c = createClient({
-      get: async (u) => {
-        seenUrl = u;
-        return { statusCode: 200, body: JSON.stringify(fixture('reply.json')) };
-      }
-    });
-    const r = await fetchReplies(c, 123, 1, 12);
-    assert.strictEqual(r.ok, true, r.message);
-    assert.ok(seenUrl.indexOf('type=12') > 0, seenUrl);
-    assert.ok(seenUrl.indexOf('oid=123') > 0, seenUrl);
-    let seen2 = '';
-    const c2 = createClient({
-      get: async (u) => {
-        seen2 = u;
-        return { statusCode: 200, body: JSON.stringify(fixture('reply.json')) };
-      }
-    });
-    await fetchReplies(c2, 1, 1);
-    assert.ok(seen2.indexOf('type=1') > 0, seen2);
-  });
-  test('reply: addReply 参数防御 + 成功/失败链（csrf/form/postForm 注入）', async () => {
-    const c = createClient({ post: async () => ({ statusCode: 200, body: '{"code":0,"data":{"rpid":555}}' }) });
-    assert.strictEqual((await addReply(c, 0, 'x', 'csrf')).stage, 'param');
-    assert.strictEqual((await addReply(c, 1, '   ', 'csrf')).stage, 'param');
-    assert.strictEqual((await addReply(c, 1, 'x'.repeat(1001), 'csrf')).stage, 'param');
-    assert.strictEqual((await addReply(c, 1, 'x', '')).stage, 'param');
-    let seenUrl = '';
-    let seenBody = '';
-    const c2 = createClient({
-      post: async (u, b) => {
-        seenUrl = u;
-        seenBody = b;
-        return { statusCode: 200, body: '{"code":0,"data":{"rpid":555}}' };
-      }
-    });
-    const okR = await addReply(c2, 42, '好看 了不起', 'JCT-abc');
-    assert.strictEqual(okR.ok, true, okR.message);
-    assert.strictEqual(okR.rpid, 555);
-    assert.strictEqual(seenUrl, 'https://api.bilibili.com/x/v2/reply/add');
-    assert.ok(seenBody.indexOf('oid=42') >= 0, seenBody);
-    assert.ok(seenBody.indexOf('type=1') >= 0);
-    assert.ok(seenBody.indexOf('csrf=JCT-abc') >= 0);
-    assert.ok(seenBody.indexOf(encodeURIComponent('好看 了不起')) >= 0, seenBody);
-    assert.ok(seenBody.indexOf('platform=web') >= 0);
-    const c3 = createClient({ post: async () => ({ statusCode: 200, body: '{"code":-111,"message":"csrf 校验失败"}' }) });
-    const bad = await addReply(c3, 42, 'x', 'JCT-abc');
-    assert.strictEqual(bad.ok, false);
-    assert.strictEqual(bad.code, -111);
-    // 未收录码 → describeBiliCode 兜底 'B站 code=-111'（含码值；-111 人话收录待真机命中补）
-    assert.ok(bad.message.indexOf('-111') >= 0, bad.message);
-  });
+  /* 页面 ctx 的最小假实现：只给 play_session 真正会读的字段。
+   * 取流走 ctx.douyuFetchPlayInfo（可注入），**不联网**。 */
 
-  // ---------------- history ----------------
-  test('history: 容错（旧版本/脏条目）与封顶', () => {
-    assert.strictEqual(normalizeHistory(null).items.length, 0);
-    assert.strictEqual(normalizeHistory({ version: 99, items: [{}] }).items.length, 0);
-    const raw = { version: HISTORY_VERSION, items: [] };
-    for (let i = 0; i < 15; i++) raw.items.push({ bvid: 'BV1ZCeb6NEyM', title: 'x' + i, at: i });
-    raw.items.push({ bvid: 'bad-bvid' });
-    const n = normalizeHistory(raw);
-    assert.ok(n.items.length <= MAX_HISTORY);
-    assert.strictEqual(n.items[0].bvid, 'BV1ZCeb6NEyM'); // 去重保留首条
-    // 旧版本写入的裸 hdslb 封面必须被改写到可达 CDN（本机 DNS 解析不到 hdslb）
-    const cov = normalizeHistory({
-      version: HISTORY_VERSION,
-      items: [{ bvid: 'BV1ZCeb6NEyM', cover: 'http://i0.hdslb.com/bfs/archive/a.jpg' }]
-    });
-    assert.strictEqual(cov.items[0].cover, 'http://archive.biliimg.com/bfs/archive/a.jpg');
-  });
-  test('history: pushHistory 置顶去重 + 时间戳', () => {
-    let h = { version: HISTORY_VERSION, items: [] };
-    h = pushHistory(h, { bvid: 'BV1ZCeb6NEyM', title: 'a', at: 100 }, 200);
-    h = pushHistory(h, { bvid: 'BVaaaaaaaaaa', title: 'b', at: 300 }, 300);
-    h = pushHistory(h, { bvid: 'BV1ZCeb6NEyM', title: 'a2', at: 400 }, 400);
-    assert.strictEqual(h.items.length, 2);
-    assert.strictEqual(h.items[0].bvid, 'BV1ZCeb6NEyM');
-    assert.strictEqual(h.items[0].title, 'a2');
-    assert.strictEqual(h.items[0].at, 400);
-  });
-  test('history: formatHistoryTime 同天/昨天/更早/0', () => {
-    const now = new Date(2026, 8, 22, 12, 0, 0).getTime();
-    assert.strictEqual(formatHistoryTime(new Date(2026, 8, 22, 8, 5, 0).getTime(), now), '08:05');
-    assert.strictEqual(formatHistoryTime(new Date(2026, 8, 21, 23, 59, 0).getTime(), now), '昨天');
-    assert.strictEqual(formatHistoryTime(new Date(2026, 7, 1, 10, 0, 0).getTime(), now), '08-01');
-    assert.strictEqual(formatHistoryTime(0, now), '');
-  });
-
-  // ---------------- play_session ----------------
   function fakePlayDeps(overrides) {
     const calls = { open: [], pause: 0, resume: 0, seek: [], stop: 0, release: 0, status: 0 };
     const w = {
@@ -2049,116 +780,25 @@ async function main() {
           return { ok: true };
         }
       },
-      client: {
-        fetchWbiKeys: async () => ({ ok: true, code: -101, imgKey: '7'.repeat(32), subKey: '8'.repeat(32) }),
-        fetchView: async () => ({ ok: true, cid: 42027451985, duration: 206, title: 'T', width: 1920, height: 1080 }),
-        fetchPlayurl: async () => ({
-          ok: true,
-          code: 0,
-          data: { quality: 16, durl: [{ url: 'https://upos-x.bilivideo.com/v.mp4?deadline=1', length: 999 }], accept_quality: [16] }
-        })
-      },
-      mixinMemo: {},
-      mediaUa: DEFAULT_UA,
-      mediaReferer: REFERER,
+      douyuFetchPlayInfo: async (rid, rate) => ({
+        ok: true,
+        rid: rid,
+        url: 'https://hwa.douyucdn2.cn/live/' + rid + '_900.flv?wsAuth=a&expire=0',
+        rate: rate,
+        rates: [{ name: '高清', rate: rate, bit: 900 }]
+      }),
+      mediaUa: TEST_UA,
+      mediaReferer: TEST_REFERER,
+      videoSettings: {},
       nowSec: () => 1700000000,
+      nowMs: () => 1700000000000,
       log: null,
       cancelled: () => false
     };
     if (overrides) Object.assign(w, overrides);
     return w;
   }
-  const probeItem = { kind: 'video', bvid: 'BV1ZCeb6NEyM', cid: 42027451985, durationSec: 206, title: 'x', up: 'u', cover: '' };
 
-  test('play_session: openVideo 全链（居中物理矩形 + UA/Referer + 配置帧率）', async () => {
-    const w = fakePlayDeps();
-    const r = await openVideo(w, probeItem);
-    assert.strictEqual(r.ok, true);
-    assert.strictEqual(r.session.qn, 16);
-    assert.strictEqual(r.session.durationMs, 206000);
-    const o = w.calls.open[0];
-    assert.deepStrictEqual(o.rect, { x: 0, y: 299, width: 240, height: 427 });
-    assert.strictEqual(o.userAgent, DEFAULT_UA);
-    assert.strictEqual(o.referer, REFERER);
-    assert.strictEqual(o.fps, HTML5_FPS); // 不锁死数值：锚定 openVideo 传递配置常量（v2.5.1 起 24）
-    assert.strictEqual(o.audio, true);
-    assert.strictEqual(o.transpose, 2);
-    assert.ok(o.input.indexOf('https://') === 0);
-    // fake 返回 durl 形（无 dash）→ dash两阶梯失败后回退成功 → 单文件 input2=''
-    assert.strictEqual(o.input2, '');
-  });
-  test('play_session: DASH 双流（input2 音频轨 + timelength 权威时长）', async () => {
-    const w = fakePlayDeps();
-    const dashFx = fixture('playurl_dash.json');
-    w.client.fetchPlayurl = async () => ({ ok: true, code: 0, data: dashFx.data });
-    const r = await openVideo(w, probeItem);
-    assert.strictEqual(r.ok, true, r.message);
-    // v3.1.3：阶梯首档请求 qn=80，服务端（fixture）只给到 480p → 取预算内最高 852x480。
-    // 旧断言是 qn=16（软解时代死锁 360p），硬解落地后那属于画质损失。
-    // 注意 session.width/height 是**稿件显示尺寸**（view.dimension），不是流的解码尺寸。
-    assert.strictEqual(r.session.qn, 32, '应取服务端给的最高档 480p');
-    assert.strictEqual(r.session.durationMs, 280128);
-    const o = w.calls.open[0];
-    assert.ok(o.input2 && o.input2.indexOf('https://') === 0, 'input2=' + o.input2);
-    assert.ok(o.input.indexOf('https://') === 0);
-    assert.notStrictEqual(o.input, o.input2, '视频/音频必须是两条不同的流');
-  });
-  test('play_session: 始终走 view（item 自带 cid 也不跳过）+ 权威字段回填', async () => {
-    const w = fakePlayDeps();
-    let viewed = 0;
-    w.client.fetchView = async () => {
-      viewed++;
-      return { ok: true, cid: 777, duration: 60, title: 'V', width: 1920, height: 1080 };
-    };
-    // item 自带 cid/durationSec —— 修复前会跳过 view 导致拿不到宽高（竖屏拉伸根因）
-    const r = await openVideo(w, { kind: 'video', bvid: 'BV1ZCeb6NEyM', cid: 12345, durationSec: 99, title: 'feed标题' });
-    assert.strictEqual(r.ok, true, r.message);
-    assert.strictEqual(viewed, 1, '必须调用 view');
-    assert.strictEqual(r.session.cid, 777);
-    assert.strictEqual(r.session.durationMs, 60000);
-    assert.strictEqual(r.session.title, 'feed标题', 'item 标题优先');
-    // 16:9 横屏 → 视频区(448x240)内居中的横矩形
-    assert.deepStrictEqual(w.calls.open[0].rect, { x: 0, y: 299, width: 240, height: 427 });
-  });
-  test('play_session: 竖屏稿件(1080x1920) → 物理竖柱 rect（不拉伸成横屏）', async () => {
-    const w = fakePlayDeps();
-    w.client.fetchView = async () => ({ ok: true, cid: 999, duration: 30, title: '竖屏', width: 1080, height: 1920 });
-    const r = await openVideo(w, { kind: 'video', bvid: 'BV1ZCeb6NEyM', cid: 1, durationSec: 1, title: '' });
-    assert.strictEqual(r.ok, true, r.message);
-    const rect = w.calls.open[0].rect;
-    // 信箱适配：逻辑 {380,0,135,240} → 物理 {0,445,240,135}（宽高互换的竖柱，比例=9:16 不变形）
-    assert.deepStrictEqual(rect, { x: 0, y: 445, width: 240, height: 135 });
-    assert.ok(rect.height < rect.width, '竖屏输出应为竖长方形');
-    // 输出比例 ≈ 源比例（不拉伸）：物理 h/w = 135/240 ≈ 1080/1920
-    const outRatio = rect.height / rect.width;
-    const srcRatio = 1080 / 1920;
-    assert.ok(Math.abs(outRatio - srcRatio) < 0.02, 'ratio=' + outRatio);
-  });
-  test('play_session: 取消标志生效 → stage=cancel（页面据此静默）', async () => {
-    const w = fakePlayDeps({ cancelled: () => true });
-    const r = await resolveVideoUrl(w, { bvid: 'BV1ZCeb6NEyM', cid: 1, durationSec: 1, title: 'x' });
-    assert.strictEqual(r.ok, false);
-    assert.strictEqual(r.stage, 'cancel');
-  });
-  test('play_session: 打开失败结构化 stage=open + code', async () => {
-    const w = fakePlayDeps();
-    w.player.openSession = async () => ({ ok: false, code: 'PLAYER_FB_FAILED', error: '/dev/fb0 打不开' });
-    const r = await openVideo(w, { bvid: 'BV1ZCeb6NEyM', cid: 5, durationSec: 10, title: 't' });
-    assert.strictEqual(r.ok, false);
-    assert.strictEqual(r.stage, 'open');
-    assert.ok(r.message.indexOf('PLAYER_FB_FAILED') >= 0);
-  });
-  test('play_session: 非法 bvid → stage=param（不发任何请求）', async () => {
-    const w = fakePlayDeps();
-    let netCalls = 0;
-    w.client.fetchView = async () => {
-      netCalls++;
-      return { ok: true };
-    };
-    const r = await resolveVideoUrl(w, { bvid: 'x' });
-    assert.strictEqual(r.stage, 'param');
-    assert.strictEqual(netCalls, 0);
-  });
   test('play_session: toggle 映射与失败透传', async () => {
     const w = fakePlayDeps();
     const a = await togglePlay(w, true); // playing → pause
@@ -2172,53 +812,14 @@ async function main() {
     assert.strictEqual(c.ok, false);
     assert.ok(c.message.indexOf('PLAYER_CALL_FAILED') >= 0);
   });
-  test('play_session: seekBy 钳制 [0, duration-1s]，时长未知不设上界', async () => {
-    const w = fakePlayDeps();
-    const a = await seekBy(w, 5000, 206000, 20000);
-    assert.strictEqual(a.target, 25000);
-    const b = await seekBy(w, 195000, 206000, 20000);
-    assert.strictEqual(b.target, 205000);
-    const c = await seekBy(w, 5000, 206000, -20000);
-    assert.strictEqual(c.target, 0);
-    const d = await seekBy(w, 5000, 0, 20000);
-    assert.strictEqual(d.target, 25000);
-    assert.deepStrictEqual(w.calls.seek, [25000, 205000, 0, 25000]);
-  });
-  test('play_session: seekTo 绝对定位（P1-7：不再用旧 positionMs 算 delta）', async () => {
-    const w = fakePlayDeps();
-    // 落点就是目标本身，与当前 positionMs 无关 —— 旧实现会偏 ±1000ms
-    const a = await seekTo(w, 90000, 206000);
-    assert.strictEqual(a.ok, true);
-    assert.strictEqual(a.target, 90000);
-    assert.strictEqual(w.calls.seek[0], 90000);
-    // 上界钳到 duration-1s（越界 seek 会让 gst 立刻 EOS）
-    const b = await seekTo(w, 999999, 206000);
-    assert.strictEqual(b.target, 205000);
-    // 下界钳到 0
-    const c = await seekTo(w, -5000, 206000);
-    assert.strictEqual(c.target, 0);
-    // 时长未知（直播）不设上界
-    const d = await seekTo(w, 123456, 0);
-    assert.strictEqual(d.target, 123456);
-    // 小数向下取整
-    const e = await seekTo(w, 1234.9, 206000);
-    assert.strictEqual(e.target, 1234);
-    assert.deepStrictEqual(w.calls.seek, [90000, 205000, 0, 123456, 1234]);
-  });
-  test('play_session: seekTo 优先用 native 的 seekTargetMs（覆盖式 seek 的落点）', async () => {
-    const w = fakePlayDeps();
-    w.player.seek = async (ms) => ({ ok: true, positionMs: 1, seekTargetMs: ms, seekPending: true });
-    const r = await seekTo(w, 45000, 206000);
-    assert.strictEqual(r.ok, true);
-    assert.strictEqual(r.positionMs, 45000, '有 seekTargetMs 就以它为准，不用滞后的 positionMs');
-    assert.strictEqual(r.pending, true, 'seekPending 透传（页面据此知道落点还没生效）');
-  });
+
   test('play_session: recoverSession 无 recover() → PLAYER_UNSUPPORTED（不抛）', async () => {
     const w = fakePlayDeps();
     const r = await recoverSession(w);
     assert.strictEqual(r.ok, false);
     assert.strictEqual(r.code, 'PLAYER_UNSUPPORTED');
   });
+
   test('play_session: recoverSession 有 recover() → 透传 ok/state', async () => {
     const w = fakePlayDeps();
     w.player.recover = async () => ({ ok: true, state: 'playing' });
@@ -2226,6 +827,7 @@ async function main() {
     assert.strictEqual(r.ok, true);
     assert.strictEqual(r.state, 'playing');
   });
+
   test('play_session: recoverSession recover() 抛错 → PLAYER_RECOVER_FAILED', async () => {
     const w = fakePlayDeps();
     w.player.recover = async () => {
@@ -2236,6 +838,7 @@ async function main() {
     assert.strictEqual(r.code, 'PLAYER_RECOVER_FAILED');
     assert.strictEqual(r.message, 'boom');
   });
+
   test('play_session: readStatus 透传 player2 新字段（缺省给安全默认值）', async () => {
     const w = fakePlayDeps();
     // v2 全字段
@@ -2255,8 +858,6 @@ async function main() {
       lastErrorMsg: 'EOS'
     });
     const s = await readStatus(w);
-    assert.strictEqual(s.seekPending, true);
-    assert.strictEqual(s.seekTargetMs, 90000);
     assert.strictEqual(s.planeActive, false);
     assert.strictEqual(s.pipelineAlive, false);
     assert.strictEqual(s.nativeDurationMs, 206000);
@@ -2267,8 +868,6 @@ async function main() {
     // v1（没有这些字段）→ 安全默认值，页面逻辑不会因为 undefined 走错分支
     w.player.status = async () => ({ ok: true, state: 'playing', frames: 5, positionMs: 100 });
     const v1 = await readStatus(w);
-    assert.strictEqual(v1.seekPending, false);
-    assert.strictEqual(v1.seekTargetMs, 0);
     assert.strictEqual(v1.planeActive, true, '缺省视为平面正常，不能误判成故障');
     assert.strictEqual(v1.pipelineAlive, true);
     assert.strictEqual(v1.hasAudio, true);
@@ -2277,6 +876,7 @@ async function main() {
     assert.strictEqual(v1.lastError, 0);
     assert.strictEqual(v1.lastErrorMsg, '');
   });
+
   test('play_session: readStatus 错误翻译 + closeSession 幂等连打', async () => {
     const w = fakePlayDeps();
     w.player.status = async () => ({
@@ -2302,6 +902,7 @@ async function main() {
     assert.strictEqual(w.calls.stop, 2);
     assert.strictEqual(w.calls.release, 2);
   });
+
   test('play_session: readStatus 透传 v2.1.0 强制重同步字段', async () => {
     const w = fakePlayDeps();
     w.player.status = async () => ({
@@ -2324,8 +925,11 @@ async function main() {
     assert.strictEqual(st2.resyncing, false);
     assert.strictEqual(st2.resyncCount, 0);
   });
+
   test('play_session: describePlayError 阶段翻译 + 步长常量', () => {
-    assert.ok(describePlayError({ ok: false, stage: 'wbi', message: 'x' }).indexOf('签名') >= 0);
+    assert.ok(describePlayError({ ok: false, stage: 'playurl', message: 'x' }).indexOf('取流') >= 0);
+    assert.ok(describePlayError({ ok: false, stage: 'transport', message: 'x' }).indexOf('网络') >= 0);
+    assert.strictEqual(describePlayError({ ok: false, stage: 'offline', message: '主播未开播' }), '主播未开播');
     assert.strictEqual(describePlayError({ ok: false, stage: 'cancel', message: '已取消' }), '');
     assert.strictEqual(describePlayError({ ok: true }), '');
     assert.strictEqual(SEEK_STEP_MS, 20000);
@@ -2336,6 +940,7 @@ async function main() {
    * (did, rid, ts, auth)。native 的断流重连用 open 时的原 URL，5 分钟后必然
    * 403 —— JS 必须提前换链。改后缀/续 query 都过不了签名（实测改 _900→_4000
    * 直接 403），只能重走 getEncryption → getH5PlayV1。 */
+
   test('play_session: LIVE_URL_TTL_MS / LIVE_URL_REFRESH_MS 常量（换链留足余量）', () => {
     assert.strictEqual(LIVE_URL_TTL_MS, 300000, '斗鱼 expire=300s');
     assert.strictEqual(LIVE_URL_REFRESH_MS, 210000, '提前 90s 换链');
@@ -2343,6 +948,7 @@ async function main() {
     assert.ok(LIVE_URL_TTL_MS - LIVE_URL_REFRESH_MS >= 60000,
       '余量要够走完两次签名请求 + 一次重试（实测单次 300~900ms，但 Wi-Fi 抖动远大于此）');
   });
+
   test('play_session: shouldRefreshLiveUrl 边界（纯函数，喂假 nowMs）', () => {
     const T0 = 1000000;
     // 非直播：点播的直链虽然也过期，但换链会打断播放位置 → 一律不换
@@ -2365,11 +971,12 @@ async function main() {
     assert.strictEqual(shouldRefreshLiveUrl({ live: true, liveUrlAt: T0 }, NaN), false);
     assert.strictEqual(shouldRefreshLiveUrl({ live: true, liveUrlAt: T0 }, undefined), false);
   });
-  test('play_session: 斗鱼 item 走 douyu 取流分支（site 判别，不碰 B 站 client）', async () => {
+
+  test('play_session: 斗鱼 item 走 douyu 取流分支（只认 ctx.douyuFetchPlayInfo）', async () => {
     const seen = [];
     const ctx = {
-      // B 站 client 故意爆炸：斗鱼条目绝不该碰它
-      client: { request: async () => { throw new Error('不应该请求 B 站接口'); } },
+      // 取流以外的接口一律不该被碰：塞个必定爆炸的假 client 作哨兵
+      client: { request: async () => { throw new Error('不应调用取流以外的接口'); } },
       videoSettings: {},
       nowMs: () => 1700000000000,
       douyuFetchPlayInfo: async (rid, rate) => {
@@ -2390,7 +997,6 @@ async function main() {
     assert.strictEqual(r.audioUrl, '', 'FLV 自带音轨：回填会开第二条连接');
     assert.strictEqual(r.durationMs, 0);
     assert.strictEqual(r.roomid, 9);
-    assert.strictEqual(r.aid, 0);
     assert.strictEqual(r.qn, 2, 'qn 用服务端实际档位');
     assert.deepStrictEqual(seen, [[9, 2]], '未指定 ctx.douyuRate → 默认 rate=2（doc §3）');
     assert.strictEqual(r.liveUrlAt, 1700000000000, 'liveUrlAt 必须来自 ctx.nowMs（可测）');
@@ -2412,16 +1018,7 @@ async function main() {
     assert.strictEqual(bad.stage, 'playurl');
     assert.strictEqual(bad.code, 'AUTH_REJECTED');
   });
-  test('play_session: resolveVideoUrl 把 site=douyu 也路由到直播链', async () => {
-    const ctx = {
-      nowMs: () => 1,
-      douyuFetchPlayInfo: async () => ({ ok: true, url: 'https://x/1.flv', rate: 0, rates: [] })
-    };
-    const r = await resolveVideoUrl(ctx, { site: 'douyu', rid: 7 });
-    assert.strictEqual(r.ok, true);
-    assert.strictEqual(r.live, true);
-    assert.strictEqual(r.url, 'https://x/1.flv');
-  });
+
   test('play_session: openVideo 直播透传 liveUrlAt / site / rates', async () => {
     const w = fakePlayDeps({
       nowMs: () => 1700000000123,
@@ -2443,12 +1040,10 @@ async function main() {
     assert.strictEqual(r.session.rates.length, 1);
     assert.strictEqual(w.calls.open[0].isLive, true, 'native 必须收到 live=1（否则走 ffmpeg 路径）');
     assert.strictEqual(w.calls.open[0].input2, '', '单输入直连');
-    // 点播 session 的 liveUrlAt 恒 0（不需要换链，换链会打断播放位置）
-    const w2 = fakePlayDeps({ nowMs: () => 1700000000123 });
-    const r2 = await openVideo(w2, probeItem);
-    assert.strictEqual(r2.session.liveUrlAt, 0);
-    assert.strictEqual(r2.session.site, 'bili');
+    // 纯直播客户端：每次 openVideo 都产出直播 session，liveUrlAt 恒为本次取流时刻
+    assert.strictEqual(typeof r.session.roomid, 'number');
   });
+
   test('play_session: refreshLiveUrl 斗鱼 —— 重新签名取新链（绝不改后缀）', async () => {
     const seen = [];
     let n = 0;
@@ -2506,39 +1101,12 @@ async function main() {
     );
     assert.strictEqual(canc.stage, 'cancel');
   });
-  test('play_session: refreshLiveUrl B 站 —— 重打 getRoomPlayInfo（走 client，不碰斗鱼）', async () => {
-    let hits = 0;
-    const streams = [{
-      protocol_name: 'http_stream',
-      format: [{ format_name: 'flv', codec: [{
-        codec_name: 'avc', current_qn: 250, media_info: { width: 1280, height: 720 },
-        base_url: '/b.flv?', url_info: [{ host: 'https://d1.bilivideo.com', extra: 'e=1' }]
-      }] }]
-    }];
-    const ctx = {
-      nowMs: () => 555,
-      videoSettings: {},
-      douyuFetchPlayInfo: async () => { throw new Error('B 站会话不该走斗鱼取流'); },
-      client: { request: async () => { hits++; return { ok: true, data: { live_status: 1, playurl_info: { playurl: { stream: streams } } } }; } }
-    };
-    const r = await refreshLiveUrl(ctx, { live: true, roomid: 12345, liveUrlAt: 1 });
-    assert.strictEqual(r.ok, true);
-    assert.strictEqual(hits, 1, '必须真的重打 getRoomPlayInfo');
-    assert.ok(r.url.indexOf('https://d1.bilivideo.com') === 0, r.url);
-    assert.strictEqual(r.liveUrlAt, 555);
-    assert.strictEqual(r.qn, 250);
-    // 未开播透传 offline
-    const off = await refreshLiveUrl(
-      Object.assign({}, ctx, { client: { request: async () => ({ ok: true, data: { live_status: 0 } }) } }),
-      { live: true, roomid: 12345 }
-    );
-    assert.strictEqual(off.ok, false);
-    assert.strictEqual(off.stage, 'offline');
-  });
+
   /* ---------------- native 数值归一化（review2 审计 P0-1） ----------------
    * 核心回归点：native 的"未测到"哨兵 **-1** 必须被归一回 0。
    * 旧写法 `Number(-1) || 0` 会漏掉 -1（-1 是真值），导致看门狗的
    * `videoStallMs > 8000` 恒 false → 永不触发 → 界面永久「加载中…」。 */
+
   test('play_session: num() 把 -1 哨兵/NaN/undefined 归一到默认值', () => {
     assert.strictEqual(num(-1, 0), 0, 'native 的 -1 哨兵必须归一成 0');
     assert.strictEqual(num(-1, 7), 7, '负数一律用默认值');
@@ -2555,6 +1123,7 @@ async function main() {
     assert.strictEqual(num(9001), 9001, '不传默认值 = 0');
     assert.strictEqual(num(-1), 0);
   });
+
   test('play_session: numSigned() 保留负号 / numLatency() 保留 -1 语义', () => {
     // 诊断量：负数有意义（声音滞后、ALSA 缓冲修正、native errno）
     assert.strictEqual(numSigned(-812, 0), -812);
@@ -2571,6 +1140,7 @@ async function main() {
     assert.strictEqual(numLatency(0), 0, '0ms 是真实的"完全同步"');
     assert.strictEqual(numLatency(1200), 1200);
   });
+
   test('play_session: readStatus 归一化 videoStallMs/positionMs/frames 并把未知 state 落 error', async () => {
     const w = fakePlayDeps();
     // 起播阶段（从未出过帧）：native 返回哨兵 -1 + 负数位置
@@ -2595,7 +1165,6 @@ async function main() {
     assert.strictEqual(st.audioBytes, 0);
     assert.strictEqual(st.gateWaitMs, 0);
     assert.strictEqual(st.resyncingMs, 0);
-    assert.strictEqual(st.seekTargetMs, 0);
     assert.strictEqual(st.nativeDurationMs, 0);
     assert.strictEqual(st.nativeFps, 0);
     // 真正的停帧要原样透传（归一化不能把真实故障吃掉）
@@ -2614,6 +1183,7 @@ async function main() {
     const st4 = await readStatus(w);
     assert.strictEqual(st4.state, 'idle');
   });
+
   test('play_session: normalizeState 白名单（含 stopped→idle）', () => {
     assert.strictEqual(normalizeState('playing'), 'playing');
     assert.strictEqual(normalizeState('paused'), 'paused');
@@ -2628,424 +1198,7 @@ async function main() {
     assert.strictEqual(normalizeState(0), 'error');
     assert.strictEqual(normalizeState('PLAYING'), 'error', '大小写敏感：不猜');
   });
-  /* ================= 「定位中…」收起判据 / seekNoteDone =================
-   * 真机 bug（2026-11-03 23:12:51）：自检 seek+20s 报 5023→6039。seek 本身成功
-   * （pos=25023、首帧 201ms），但 tick 的判据只看 `frames > frames0`，而 seek 下发后
-   * ~200ms 内**旧管线仍在出帧**（native 还在 debounce）→ 误判完成 → 下一轮 tick 用
-   * native 的旧位置覆盖落点，进度条往左弹一下。下面这些用例把这个边界钉死。 */
-  test('play_session: seekNoteDone 旧 bug 场景 —— pending 未落回时不论帧数涨没涨都不算完成', () => {
-    /* 真机那一刻的实测快照：frames 180→210（旧管线还在出帧），pos 仍停在 5023。 */
-    const st = { seekPending: true, frames: 210, positionMs: 5023 };
-    assert.strictEqual(
-      seekNoteDone(st, 180, 25023, SEEK_LAND_NEAR_MS, false),
-      false,
-      'seekPending 仍为 true 时绝不能判完成（这正是回弹的根因）'
-    );
-    assert.strictEqual(
-      seekNoteDone(st, 180, 25023, SEEK_LAND_NEAR_MS, true),
-      false,
-      '即使已经见过 pending，只要它还在 true 就不算完成'
-    );
-  });
 
-  test('play_session: seekNoteDone pending 已落回且位置到位 → 完成（即使帧数被 probe_reset 归零）', () => {
-    /* do_seek 收尾会 pb2_probe_reset() 把 frames 归零，重建后的累计帧数可能长期
-     * 小于 seek 前的值 → 光看帧数会等到 4s 超时，必须允许用"位置靠近"判完成。 */
-    const st = { seekPending: false, frames: 3, positionMs: 25023 };
-    assert.strictEqual(
-      seekNoteDone(st, 180, 25023, SEEK_LAND_NEAR_MS, true),
-      true,
-      '帧数远小于基线但位置已在落点附近、且 pending 落回 → 应判完成'
-    );
-  });
-
-  test('play_session: seekNoteDone 没见过 pending 但帧数涨且位置到位 → 完成（轮询可能跳过整个 pending 窗口）', () => {
-    /* 轮询 1s 一次、do_seek 600~1400ms，整段 pending 完全可能落在两次采样之间；
-     * 若死等 sawPending，这种情况会一直等到 4s 超时（用户体验=提示挂 4 秒）。 */
-    const st = { seekPending: false, frames: 240, positionMs: 24980 };
-    assert.strictEqual(seekNoteDone(st, 180, 25023, SEEK_LAND_NEAR_MS, false), true);
-  });
-
-  test('play_session: seekNoteDone 帧数涨了但位置还是旧值 → 绝不判完成（旧 bug 的判定条件）', () => {
-    const st = { seekPending: false, frames: 240, positionMs: 6039 };
-    assert.strictEqual(
-      seekNoteDone(st, 180, 25023, SEEK_LAND_NEAR_MS, false),
-      false,
-      'frames 涨了、pending 也没见过、位置还是旧值 → 必须继续等'
-    );
-  });
-
-  test('play_session: seekNoteDone 落点未知（target=0）时只看 pending + 帧数，不误判', () => {
-    const st = { seekPending: false, frames: 240, positionMs: 6039 };
-    assert.strictEqual(
-      seekNoteDone(st, 180, 0, SEEK_LAND_NEAR_MS, false),
-      false,
-      'target 未知 + 位置在旧值 → 不能判完成'
-    );
-    assert.strictEqual(
-      seekNoteDone(st, 180, 0, SEEK_LAND_NEAR_MS, true),
-      true,
-      '见过 pending 且它落回、帧数也涨了 → 可判完成'
-    );
-  });
-
-  test('play_session: seekNoteDone 容忍脏输入（null / 非对象 / 非数字）', () => {
-    assert.strictEqual(seekNoteDone(null, 0, 0, 0, false), false);
-    assert.strictEqual(seekNoteDone(undefined, 0, 0, 0, true), false);
-    assert.strictEqual(seekNoteDone(42, 0, 0, 0, true), false);
-    assert.strictEqual(seekNoteDone({ seekPending: false, frames: 'x', positionMs: 'y' }, 0, 0, 0, true), false);
-  });
-
-  test('play_session: waitLanded 正常落点（等 seekPending 落 0 + 位置靠近目标）', async () => {
-    /* 假时钟：now 不自动走，sleep 推进时间 —— 这样不真等 8 秒，也不依赖系统时钟。 */
-    function clock() {
-      let t = 1000;
-      return {
-        now: function () {
-          return t;
-        },
-        sleep: async function (ms) {
-          t += ms || 100;
-        }
-      };
-    }
-    const c = clock();
-    const seq = [
-      { ok: true, seekPending: true, positionMs: 0, frames: 0 },
-      { ok: true, seekPending: true, positionMs: 0, frames: 0 },
-      { ok: true, seekPending: false, positionMs: 300120, frames: 3 }
-    ];
-    let n = 0;
-    const r = await waitLanded(
-      async function () {
-        return seq[Math.min(n++, seq.length - 1)];
-      },
-      300000,
-      { now: c.now, sleep: c.sleep }
-    );
-    assert.strictEqual(r.ok, true, '落点到了就该 ok');
-    assert.strictEqual(r.landing, 300120);
-    assert.strictEqual(r.drift, 120, 'drift=landing-target，正数=落在目标之后');
-    assert.strictEqual(r.samples, 3);
-    assert.strictEqual(r.sawPending, true, '必须观察到 seekPending=true（证明命令被 native 受理）');
-  });
-
-  test('play_session: waitLanded 超时（seekPending 一直不落 0 → TIMEOUT，drift 必须是 null）', async () => {
-    let t = 1000;
-    const r = await waitLanded(
-      async function () {
-        return { ok: true, seekPending: true, positionMs: 0, frames: 0 };
-      },
-      300000,
-      {
-        now: function () {
-          return t;
-        },
-        sleep: async function (ms) {
-          t += ms || 100;
-        }
-      }
-    );
-    assert.strictEqual(r.ok, false);
-    assert.strictEqual(r.error, 'TIMEOUT');
-    assert.strictEqual(r.drift, null, '没落点就没有偏差，调用方会打 n/a 而不是 0ms');
-    assert.strictEqual(r.landing, 0);
-    assert.ok(r.waitedMs >= SEEK_LAND_DEADLINE_MS, '应等满 deadline');
-    assert.ok(r.samples >= 2);
-  });
-
-  test('play_session: waitLanded 遇 native 错误态立刻失败（不空转到 deadline）', async () => {
-    let t = 1000;
-    const r = await waitLanded(
-      async function () {
-        return { ok: false, state: 'error', message: '取流失败：HTTP 403', positionMs: 0, frames: 0 };
-      },
-      300000,
-      {
-        now: function () {
-          return t;
-        },
-        sleep: async function (ms) {
-          t += ms || 100;
-        }
-      }
-    );
-    assert.strictEqual(r.ok, false);
-    assert.strictEqual(r.error, '取流失败：HTTP 403', '错误原因要透传，不能变成 TIMEOUT');
-    assert.strictEqual(r.samples, 1, '第一次读到 error 就该返回');
-    assert.strictEqual(r.drift, null);
-  });
-
-  test('play_session: waitLanded failOnNewError 识别「seek 没落点」（native 不清 state，只 patch lastError）', async () => {
-    let t = 1000;
-    /* 模拟 native P0-3 修复的行为：第一次采样基线 lastError=0，
-     * 之后 patch_error(PB2_E_SEEK=10, "seek did not land") 且位置停在原地。 */
-    const seq = [
-      { ok: true, seekPending: true, positionMs: 47000, frames: 900, lastError: 0, lastErrorMsg: '' },
-      { ok: true, seekPending: true, positionMs: 47000, frames: 900, lastError: 0, lastErrorMsg: '' },
-      {
-        ok: true,
-        seekPending: false,
-        positionMs: 47000,
-        frames: 901,
-        lastError: 10,
-        lastErrorMsg: 'seek did not land'
-      }
-    ];
-    let n = 0;
-    const c = {
-      now: function () {
-        return t;
-      },
-      sleep: async function (ms) {
-        t += ms || 100;
-      }
-    };
-    const r = await waitLanded(
-      async function () {
-        return seq[Math.min(n++, seq.length - 1)];
-      },
-      316629,
-      { now: c.now, sleep: c.sleep, failOnNewError: true }
-    );
-    assert.strictEqual(r.ok, false, 'native 报了 seek 新错 → 不能当成落点');
-    assert.ok(r.error.indexOf('seek did not land') >= 0, '错误原因要带上 native 原文');
-    assert.ok(r.error.indexOf('47000') >= 0, '诊断要留下真实落点，便于判断"画面没动"');
-    assert.strictEqual(r.samples, 3, '第三帧才出现新错，前两帧不能误报');
-    /* 不开 failOnNewError 时（默认）同一序列应等到 deadline 才 TIMEOUT */
-    let t2 = 1000;
-    const dflt = await waitLanded(
-      async function () {
-        return seq[seq.length - 1];
-      },
-      316629,
-      {
-        now: function () {
-          return t2;
-        },
-        sleep: async function (ms) {
-          t2 += ms || 100;
-        }
-      }
-    );
-    assert.strictEqual(dflt.ok, false);
-    assert.strictEqual(dflt.error, 'TIMEOUT', '默认行为保持不变（纯等落点）');
-  });
-  test('play_session: waitLanded failOnNewError 不把「错误被清零」当失败（native 自愈成功会 patch_error(0,"")）', async () => {
-    let t = 1000;
-    /* 上一轮失败的 lastError=10 留在 stats 里，这次 seek 自愈成功 → native
-     * patch_error(PB2_E_NONE=0, "") 清空错误。这是"变好了"，不能判失败。 */
-    const seq = [
-      { ok: true, seekPending: true, positionMs: 1000, frames: 0, lastError: 10, lastErrorMsg: 'seek did not land' },
-      { ok: true, seekPending: false, positionMs: 316000, frames: 0, lastError: 0, lastErrorMsg: '' }
-    ];
-    let n = 0;
-    const r = await waitLanded(
-      async function () {
-        return seq[Math.min(n++, seq.length - 1)];
-      },
-      316000,
-      {
-        failOnNewError: true,
-        now: function () {
-          return t;
-        },
-        sleep: async function (ms) {
-          t += ms || 100;
-        }
-      }
-    );
-    assert.strictEqual(r.ok, true, '错误被清空 + 位置到位 = 自愈成功，必须判落点');
-    assert.strictEqual(r.landing, 316000);
-  });
-  test('play_session: waitLanded 落点偏差过大不算落点（可放大 near 覆盖）', async () => {
-    let t = 1000;
-    const st = { ok: true, seekPending: false, positionMs: 291000, frames: 5 }; // 距目标 9000ms
-    const far = await waitLanded(
-      async function () {
-        return st;
-      },
-      300000,
-      {
-        now: function () {
-          return t;
-        },
-        sleep: async function (ms) {
-          t += ms || 100;
-        }
-      }
-    );
-    assert.strictEqual(far.ok, false, '偏 9000ms 超出 near=' + SEEK_LAND_NEAR_MS + '，不能算落点');
-    assert.strictEqual(far.error, 'TIMEOUT');
-    assert.strictEqual(far.lastPos, 291000, '超时也要把最后看到的位置留下来做诊断');
-    assert.strictEqual(far.drift, null);
-    let t2 = 1000;
-    const near2 = await waitLanded(
-      async function () {
-        return st;
-      },
-      300000,
-      {
-        near: 20000,
-        now: function () {
-          return t2;
-        },
-        sleep: async function (ms) {
-          t2 += ms || 100;
-        }
-      }
-    );
-    assert.strictEqual(near2.ok, true, '放大 near 后同一序列应判定落点');
-    assert.strictEqual(near2.drift, -9000, '落点在目标之前 → drift 为负');
-  });
-
-  test('play_session: waitLanded 位置已到位但 seekPending 仍 true → 不许提前成功（防假阳性）', async () => {
-    let t = 1000;
-    const seq = [
-      { ok: true, seekPending: true, positionMs: 300000, frames: 0 }, // 位置"看起来"已在目标
-      { ok: true, seekPending: true, positionMs: 300000, frames: 1 },
-      { ok: true, seekPending: false, positionMs: 300400, frames: 2 }
-    ];
-    let n = 0;
-    const r = await waitLanded(
-      async function () {
-        return seq[Math.min(n++, seq.length - 1)];
-      },
-      300000,
-      {
-        now: function () {
-          return t;
-        },
-        sleep: async function (ms) {
-          t += ms || 100;
-        }
-      }
-    );
-    assert.strictEqual(r.ok, true);
-    assert.strictEqual(r.samples, 3, '必须等到 seekPending 落 0 的那次采样');
-    assert.strictEqual(n, 3, '前两次不能提前 break');
-    /* requireSettled:false 时（老 native 根本没这个字段）应允许第一次就成功 */
-    let t2 = 1000;
-    const loose = await waitLanded(
-      async function () {
-        return { ok: true, seekPending: true, positionMs: 300000, frames: 0 };
-      },
-      300000,
-      {
-        requireSettled: false,
-        now: function () {
-          return t2;
-        },
-        sleep: async function (ms) {
-          t2 += ms || 100;
-        }
-      }
-    );
-    assert.strictEqual(loose.ok, true);
-    assert.strictEqual(loose.samples, 1);
-  });
-
-  test('play_session: waitFirstFrame 等 frames>0（seek 后 native 会把 frames 归零）', async () => {
-    let t = 1000;
-    const seq = [
-      { ok: true, frames: 0, positionMs: 300000 },
-      { ok: true, frames: 0, positionMs: 300100 },
-      { ok: true, frames: 4, positionMs: 300220 }
-    ];
-    let n = 0;
-    const r = await waitFirstFrame(
-      async function () {
-        return seq[Math.min(n++, seq.length - 1)];
-      },
-      {
-        now: function () {
-          return t;
-        },
-        sleep: async function (ms) {
-          t += ms || 100;
-        }
-      }
-    );
-    assert.strictEqual(r.ok, true);
-    assert.strictEqual(r.frames, 4);
-    assert.ok(r.frameMs >= 0, '到首帧耗时必须可量化');
-    /* 一直不出帧 → 软失败（不影响落点结论），frameMs=-1 */
-    let t2 = 1000;
-    const none = await waitFirstFrame(
-      async function () {
-        return { ok: true, frames: 0, positionMs: 300000 };
-      },
-      {
-        deadlineMs: 500,
-        now: function () {
-          return t2;
-        },
-        sleep: async function (ms) {
-          t2 += ms || 100;
-        }
-      }
-    );
-    assert.strictEqual(none.ok, false);
-    assert.strictEqual(none.error, 'NO_FRAME');
-    assert.strictEqual(none.frameMs, -1);
-  });
-  /* ---------- n9：流末尾判据（播放到结尾的自愈死循环） ----------
-   * 真机 2026-11-01 08:22 的死循环：视频 dur=114900 播到 114879 后源 ffmpeg 正常退出、
-   * 但 EOS 一直没到 → native 的 state 永远停在 playing（只 patch_alive(0)）→ JS 看门狗
-   * 判假死 → 原地 seek(pos=118776，被 clamp 到 113900) → 重开 ffmpeg 读 1 秒又死 →
-   * 每 60s 一轮无限循环，界面永远不显示「已播完」。
-   * 修法：用 JS 可得的量（位置 vs 时长、pipelineAlive）在自愈之前先判「其实播完了」。 */
-  test('play_session: isStreamEnded 判末尾（位置到时长的最后 1s）', () => {
-    const dur = 114900;
-    // 阈值常量本身也要锁住（改小会让正常播放被提前判完）
-    assert.strictEqual(END_TAIL_MS, 1000);
-    assert.strictEqual(END_DEAD_TAIL_MS, 3000);
-    assert.strictEqual(isStreamEnded({ positionMs: 114879, pipelineAlive: true }, dur), true);
-    assert.strictEqual(isStreamEnded({ positionMs: 113900, pipelineAlive: true }, dur), true);
-    assert.strictEqual(isStreamEnded({ positionMs: dur, pipelineAlive: true }, dur), true);
-    // 越过时长（真机那次 pos=118776 > dur）同样算末尾
-    assert.strictEqual(isStreamEnded({ positionMs: 118776, pipelineAlive: true }, dur), true);
-    assert.strictEqual(isStreamEnded({ positionMs: 12000, pipelineAlive: true }, dur), false);
-    // 显式传 durationMs 优先于 st.durationMs
-    assert.strictEqual(isStreamEnded({ positionMs: 50000, durationMs: 51000 }, dur), false);
-    assert.strictEqual(isStreamEnded({ positionMs: 50000, durationMs: 51000 }), true);
-  });
-  test('play_session: isStreamEnded「管线已死 + 贴近末尾」也算播完（真机死循环形态）', () => {
-    const dur = 114900;
-    /* native 的 alive=0 是"源读完退出"的典型形态：此时位置通常离末尾 1~3s 内。
-     * 这是本缺陷的关键分支 —— state 仍是 playing，只有 pipelineAlive 变了。 */
-    assert.strictEqual(isStreamEnded({ positionMs: 113000, pipelineAlive: false }, dur), true);
-    assert.strictEqual(isStreamEnded({ positionMs: 112000, pipelineAlive: false }, dur), true);
-    // 但管线死了且位置很靠前 → 不是播完，交给看门狗真去救
-    assert.strictEqual(isStreamEnded({ positionMs: 60000, pipelineAlive: false }, dur), false);
-    // 管线活着、位置靠前 → 更不是播完
-    assert.strictEqual(isStreamEnded({ positionMs: 112000, pipelineAlive: true }, dur), false);
-  });
-  test('play_session: isStreamEnded 正常播放中不误判 / 直播不误判', () => {
-    /* 这三条是防回归的核心：误判会把正在播的视频提前打成「已播完」。 */
-    // ① 正常播放中（位置远小于时长）绝不判完
-    assert.strictEqual(isStreamEnded({ positionMs: 0, pipelineAlive: true }, 114900), false);
-    assert.strictEqual(isStreamEnded({ positionMs: 30000, pipelineAlive: true }, 114900), false);
-    assert.strictEqual(isStreamEnded({ positionMs: 90000, pipelineAlive: true }, 114900), false);
-    // ② 直播（dur=0 = 时长未知）永远不判末尾，哪怕位置很大、管线已死
-    assert.strictEqual(isStreamEnded({ positionMs: 3600000, pipelineAlive: true }, 0), false);
-    assert.strictEqual(isStreamEnded({ positionMs: 3600000, pipelineAlive: false }, 0), false);
-    assert.strictEqual(isStreamEnded({ positionMs: 999999 }, undefined), false);
-    // ③ 位置为 0（还没起来）不判完，交给「无首帧」看门狗
-    assert.strictEqual(isStreamEnded({ positionMs: 0, pipelineAlive: false }, 114900), false);
-    // ④ 脏输入不崩
-    assert.strictEqual(isStreamEnded(null, 114900), false);
-    assert.strictEqual(isStreamEnded(undefined, 114900), false);
-    assert.strictEqual(isStreamEnded('x', 114900), false);
-    assert.strictEqual(isStreamEnded({}, 114900), false);
-    /* ⑤ 契约：isStreamEnded 是**纯位置判据**，不看 st.state。
-     * 这是故意的 —— 真机上末尾时 state 停在 'playing'（EOS 没来），若函数内部
-     * 依赖 state 就永远判不出来。而"暂停在最后一秒不算播完"的门禁放在调用点
-     * （index.vue 的 tick 里 `st.state === 'playing' &&` 前置），职责分离、各自可测。 */
-    assert.strictEqual(isStreamEnded({ positionMs: 114879, state: 'playing' }, 114900), true);
-    assert.strictEqual(isStreamEnded({ positionMs: 114879, state: 'paused' }, 114900), true);
-    assert.strictEqual(isStreamEnded({ positionMs: 114879 }, 114900), true);
-  });
   test('play_session: isLiveEnded 主播下播（state 落回 idle）判直播已结束', () => {
     /* 真机契约：直播 EOS → native patch_state(STOPPED) → normalizeState 归一成
      * 'idle'，而页面只认 'ended' → 提示永远不出来（P1-4）。isLiveEnded 必须
@@ -3061,6 +1214,7 @@ async function main() {
     assert.strictEqual(isLiveEnded({ state: 'idle', positionMs: 3000, frames: 0 }, true, false), false);
     assert.strictEqual(isLiveEnded({ state: 'idle', positionMs: 600000, frames: 0 }, true, false), false);
   });
+
   test('play_session: isLiveEnded 不误判「刚进页面还没起播」/ 点播 / 仍在播', () => {
     /* ★ 这是 lead 点名的核心边界：刚进直播间时 state 也是 idle/opening、
      * 位置 0、没出过帧 —— 绝不能判成「已结束」，否则用户一进去就看到
@@ -3086,6 +1240,7 @@ async function main() {
     assert.strictEqual(isLiveEnded('x', true, true), false);
     assert.strictEqual(isLiveEnded({}, true, true), false);
   });
+
   test('play_session: isLiveReconnecting 只认直播 + 码 17（且不抢真错误态）', () => {
     /* 与 native2 对齐的码值锁死：core/queue.h 已占用 0..16，17 是下一个空位。 */
     assert.strictEqual(LIVE_RECONNECT_ERR, 17);
@@ -3112,6 +1267,7 @@ async function main() {
     assert.strictEqual(isLiveReconnecting(null, true), false);
     assert.strictEqual(isLiveReconnecting('x', true), false);
   });
+
   test('play_session: isLiveReconnecting 的 lastErrorMsg 兜底（native 换码也能提示）', () => {
     /* 万一 native2 最终没用 17（比如换了码值），只要 msg 里带 reconnect 就仍提示 ——
      * 这条兜底让「用户至少能看到点什么」不依赖单个魔法数字。 */
@@ -3132,6 +1288,7 @@ async function main() {
     assert.strictEqual(isLiveReconnecting({ state: 'playing', lastError: 17, lastErrorMsg: null }, true), true);
     assert.strictEqual(isLiveReconnecting({ state: 'playing', lastError: 0, lastErrorMsg: 42 }, true), false);
   });
+
   test('play_session: readStatus 同时给出 durationMs 与 nativeDurationMs（n10 别名）', async () => {
     const w = fakePlayDeps();
     w.player.status = async () => ({ ok: true, state: 'playing', durationMs: 114900, positionMs: 5000 });
@@ -3146,6 +1303,7 @@ async function main() {
     assert.strictEqual(st2.durationMs, 0);
     assert.strictEqual(st2.nativeDurationMs, 0);
   });
+
   test('live_end_probe: 用例表在 Node 下全部通过（与真机自证同源）', async () => {
     /* 这条测试与真机上的 probeLiveEnd 走**同一张用例表、同一个函数**：
      * 真机跑 QuickJS、这里跑 V8，两边都 PASS 才能说明判据不依赖引擎特性。
@@ -3168,6 +1326,7 @@ async function main() {
     assert.ok(r.lines[0].indexOf("Number('17')=17") >= 0, '引擎指纹应包含 Number(17)');
     assert.ok(r.lines[r.lines.length - 1].indexOf('passed=') >= 0);
   });
+
   test('live_end_probe: 用例覆盖面涵盖墙钟/刚进直播间两个关键反例', () => {
     /* 防「用例被删了也不知道」：这两条反例直接对应真机上踩过的两个 bug
      * （刚进直播间误判已结束、墙钟位置当「播过」证据），丢了就会回退。 */
@@ -3185,220 +1344,9 @@ async function main() {
     }
     assert.strictEqual(missingLive, 0, '有 ' + missingLive + ' 条 end 用例没给 live 参数');
   });
-  test('play_session: ensureMixin 会话级缓存（第二次不再打接口）', async () => {
-    const w = fakePlayDeps();
-    let n = 0;
-    w.client.fetchWbiKeys = async () => {
-      n++;
-      return { ok: true, imgKey: '1'.repeat(32), subKey: '2'.repeat(32) };
-    };
-    const a = await ensureMixin(w);
-    const b = await ensureMixin(w);
-    assert.ok(/^[0-9a-f]{32}$/.test(a));
-    assert.strictEqual(a, b);
-    assert.strictEqual(n, 1);
-  });
-  test('play_session: ensureMixinResult 透传失败细节（stage/code/message）', async () => {
-    const w = fakePlayDeps();
-    w.client.fetchWbiKeys = async () => ({
-      ok: false,
-      stage: 'api',
-      code: -352,
-      message: '风控(-352)：签名/UA 被识别异常'
-    });
-    const r = await ensureMixinResult(w);
-    assert.strictEqual(r.ok, false);
-    assert.strictEqual(r.stage, 'api');
-    assert.strictEqual(r.code, -352);
-    assert.ok(r.message.indexOf('-352') >= 0);
-  });
-
-  // ---------------- 互动（点赞/投币/收藏）----------------
-  // /x/v2/view 已下线（返回 HTML），改用 /x/web-interface/view 的 stat + 三个本人态接口。
-  const actMod = await import('../src/services/bili/action.js');
-
-  test('action: parseViewState 合并总数与本人态', () => {
-    const view = {
-      ok: true,
-      data: { stat: { view: 10707, like: 179, coin: 16, favorite: 41, share: 10, danmaku: 3 } }
-    };
-    const r = actMod.parseViewState(view, { like: 1, coin: 2, favoured: true });
-    assert.strictEqual(r.ok, true);
-    assert.strictEqual(r.like, 1);
-    assert.strictEqual(r.coin, 2);
-    assert.strictEqual(r.favorite, true);
-    assert.strictEqual(r.likeCount, 179);
-    assert.strictEqual(r.coinCount, 16);
-    assert.strictEqual(r.favCount, 41);
-    assert.strictEqual(r.viewCount, 10707);
-    assert.strictEqual(r.share, 10);
-  });
-
-  test('action: parseViewState 未登录（mine=null）→ 计数仍在、本人态归零', () => {
-    const view = { ok: true, data: { stat: { view: 5, like: 7, coin: 3, favorite: 2, share: 1 } } };
-    const r = actMod.parseViewState(view, null);
-    assert.strictEqual(r.ok, true);
-    assert.strictEqual(r.like, 0);
-    assert.strictEqual(r.coin, 0);
-    assert.strictEqual(r.favorite, false);
-    // 关键回归：未登录也必须显示全站总数，否则左栏徽标全空
-    assert.strictEqual(r.likeCount, 7);
-    assert.strictEqual(r.coinCount, 3);
-    assert.strictEqual(r.favCount, 2);
-  });
-
-  test('action: parseViewState 计数缺失/异常归一为 0', () => {
-    const r = actMod.parseViewState({ ok: true, data: {} }, { like: 0, coin: 0, favoured: false });
-    assert.strictEqual(r.ok, true);
-    assert.strictEqual(r.likeCount, 0);
-    assert.strictEqual(r.coinCount, 0);
-    assert.strictEqual(r.favCount, 0);
-    assert.strictEqual(r.viewCount, 0);
-  });
-
-  test('action: parseViewState 失败透传 stage/code', () => {
-    const r = actMod.parseViewState({ ok: false, stage: 'api', code: -404, message: '啥都木有' }, null);
-    assert.strictEqual(r.ok, false);
-    assert.strictEqual(r.stage, 'api');
-    assert.strictEqual(r.code, -404);
-  });
-
-  test('action: parseViewState coin 钳到 0..2，like 归一到 0/1', () => {
-    const view = { ok: true, data: { stat: {} } };
-    assert.strictEqual(actMod.parseViewState(view, { like: 2, coin: 9 }).coin, 2);
-    assert.strictEqual(actMod.parseViewState(view, { like: 2, coin: -1 }).coin, 0);
-    assert.strictEqual(actMod.parseViewState(view, { like: 2 }).like, 1);
-  });
-
-  test('action: fetchViewState 并行取 view + 三个本人态接口', async () => {
-    const calls = [];
-    const fake = {
-      request: (path, q, o) => {
-        calls.push({ path, q, o });
-        if (path === actMod.VIEW_URL) {
-          return Promise.resolve({ ok: true, data: { stat: { like: 9, coin: 4, favorite: 2 } } });
-        }
-        if (path === actMod.HAS_LIKE_URL) return Promise.resolve({ ok: true, data: 1 });
-        if (path === actMod.COINS_URL) return Promise.resolve({ ok: true, data: { multiply: 2 } });
-        if (path === actMod.FAVOURED_URL) return Promise.resolve({ ok: true, data: { favoured: true } });
-        return Promise.resolve({ ok: false, stage: 'api', code: -101 });
-      }
-    };
-    const r = await actMod.fetchViewState(fake, 117510305224263);
-    assert.strictEqual(r.ok, true);
-    assert.strictEqual(r.like, 1);
-    assert.strictEqual(r.coin, 2);
-    assert.strictEqual(r.favorite, true);
-    assert.strictEqual(r.likeCount, 9);
-    assert.strictEqual(calls.length, 4);
-    // 本人态三接口必须带 acceptCodes:[-101,0]，否则未登录会被当硬失败
-    for (const c of calls.slice(1)) {
-      assert.deepStrictEqual(c.o.acceptCodes, [-101, 0]);
-      assert.strictEqual(c.q.aid, 117510305224263);
-    }
-  });
-
-  test('action: fetchViewState 未登录（-101）仍返回全站计数', async () => {
-    const fake = {
-      request: (path) => {
-        if (path === actMod.VIEW_URL) {
-          return Promise.resolve({ ok: true, data: { stat: { like: 179, coin: 16, favorite: 41, view: 10707 } } });
-        }
-        return Promise.resolve({ ok: true, code: -101, data: null });
-      }
-    };
-    const r = await actMod.fetchViewState(fake, 1);
-    assert.strictEqual(r.ok, true);
-    assert.strictEqual(r.like, 0);
-    assert.strictEqual(r.coin, 0);
-    assert.strictEqual(r.favorite, false);
-    assert.strictEqual(r.likeCount, 179);
-    assert.strictEqual(r.favCount, 41);
-  });
-
-  test('action: fetchViewState 缺 aid → param 失败且不发请求', async () => {
-    let n = 0;
-    const fake = {
-      request: () => {
-        n++;
-        return Promise.resolve({ ok: true, data: {} });
-      }
-    };
-    const r = await actMod.fetchViewState(fake, 0);
-    assert.strictEqual(r.ok, false);
-    assert.strictEqual(r.stage, 'param');
-    assert.strictEqual(n, 0);
-  });
-
-  test('action: has/like 兼容数字与 {is_like} 两种形态', async () => {
-    const mk = (data) => ({
-      request: (path) => {
-        if (path === actMod.VIEW_URL) return Promise.resolve({ ok: true, data: { stat: {} } });
-        if (path === actMod.HAS_LIKE_URL) return Promise.resolve({ ok: true, data: data });
-        return Promise.resolve({ ok: true, data: null });
-      }
-    });
-    assert.strictEqual((await actMod.fetchViewState(mk(1), 1)).like, 1);
-    assert.strictEqual((await actMod.fetchViewState(mk(0), 1)).like, 0);
-    assert.strictEqual((await actMod.fetchViewState(mk({ is_like: true }), 1)).like, 1);
-    assert.strictEqual((await actMod.fetchViewState(mk({ is_like: false }), 1)).like, 0);
-  });
-
-  test('action: setLike 取消赞必须发 like=2（不是 0）', async () => {
-    const forms = [];
-    const fake = {
-      postForm: (url, form) => {
-        forms.push({ url, form });
-        return Promise.resolve({ ok: true, code: 0 });
-      }
-    };
-    await actMod.setLike(fake, 42, true, 'tok');
-    await actMod.setLike(fake, 42, false, 'tok');
-    assert.ok(forms[0].form.indexOf('like=1') >= 0, forms[0].form);
-    assert.ok(forms[1].form.indexOf('like=2') >= 0, forms[1].form);
-    assert.ok(forms[1].form.indexOf('like=0') < 0, '取消赞不能发 0');
-  });
-
-  test('action: addCoin 参数与 select_like', async () => {
-    const forms = [];
-    const fake = {
-      postForm: (url, form) => {
-        forms.push({ url, form });
-        return Promise.resolve({ ok: true, code: 0 });
-      }
-    };
-    await actMod.addCoin(fake, 42, 2, true, 'tok');
-    assert.ok(forms[0].form.indexOf('aid=42') >= 0, forms[0].form);
-    assert.ok(forms[0].form.indexOf('multiply=2') >= 0, forms[0].form);
-    assert.ok(forms[0].form.indexOf('select_like=1') >= 0, forms[0].form);
-  });
-
-  test('action: dealFav 必须 type=2，且 add/del 都空时 param 失败', async () => {
-    const forms = [];
-    const fake = {
-      postForm: (url, form) => {
-        forms.push({ url, form });
-        return Promise.resolve({ ok: true, code: 0 });
-      }
-    };
-    await actMod.dealFav(fake, 42, [7], [], 'tok');
-    assert.ok(forms[0].form.indexOf('rid=42') >= 0, forms[0].form);
-    assert.ok(forms[0].form.indexOf('type=2') >= 0, forms[0].form);
-    assert.ok(forms[0].form.indexOf('add_media_ids=7') >= 0, forms[0].form);
-    const before = forms.length;
-    const r = await actMod.dealFav(fake, 42, [], [], 'tok');
-    assert.strictEqual(r.ok, false);
-    assert.strictEqual(forms.length, before);
-  });
-
-  test('action: 写接口缺 csrf → param 失败', async () => {
-    const fake = { postForm: () => Promise.resolve({ ok: true, code: 0 }) };
-    assert.strictEqual((await actMod.setLike(fake, 1, true, '')).stage, 'param');
-    assert.strictEqual((await actMod.addCoin(fake, 1, 1, false, '')).stage, 'param');
-    assert.strictEqual((await actMod.dealFav(fake, 1, [1], [], '')).stage, 'param');
-  });
 
   // ---------------- 主页网格：加载更多后必须整行（用户要求 m11950-3）----------------
+
   test('screen: trimToGridRows 尾部裁到列数整数倍', () => {
     assert.strictEqual(GRID_COLS, 5);
     // 12 → 10（裁 2）；15 不变；0/1/4 全裁掉
@@ -3416,6 +1364,7 @@ async function main() {
   });
 
   // ---------------- 播放几何（213 + 469 + 278 = 960，用户手绘稿 m11950）----------------
+
   test('screen: playVideoRects 16:9 居中，物理 {0,299,240,427}（真·旋转变换）', () => {
     const r = playVideoRects(640, 360);
     assert.deepStrictEqual(r.logical, { x: 234, y: 0, width: 427, height: 240 });
@@ -3423,6 +1372,7 @@ async function main() {
     assert.strictEqual(BAR_WIDTH, 76);
     assert.strictEqual(BAR_WIDTH + r.logical.width + BAR_WIDTH, 579); // 16:9 只占 427
   });
+
   test('screen: 竖屏 playVideoRects → 物理竖柱（9:16 不变形）', () => {
     const r = playVideoRects(360, 640);
     assert.deepStrictEqual(r.logical, { x: 380, y: 0, width: 135, height: 240 });
@@ -3433,6 +1383,7 @@ async function main() {
     assert.ok(Math.abs(out - src) < 0.02, 'src=' + src + ' out=' + out);
     assert.ok(isRectInsidePanel(r.physical));
   });
+
   test('screen: 宽比例视频必须信箱进视频区 469x240（越区溢出回归防护）', () => {
     // 历史 bug（X5 800x254）：fit box=全屏 → 比 16:9 更宽的视频按高适配得 w>列宽 →
     // 画面溢出到左栏按钮与右栏评论区（真机实测）。
@@ -3473,9 +1424,13 @@ async function main() {
   });
 
   // ---------------- 直播视频区（无进度条，469x266）----------------
+
   // 用户反馈 m07570-3：「直播界面不应该出现进度条」。进度条那条 26px 让给画面后，
+
   // KMS 平面的逻辑矩形也必须从 240 高变成 266 高，否则画面下方会留一条黑边，
+
   // 而 hole 的点击热区是 266 —— 用户点黑边能暂停、看着却像没画面。
+
   test('screen: LIVE_VIDEO_AREA 比点播高 26px（让出进度条那条）', () => {
     assert.strictEqual(LIVE_VIDEO_AREA.height, 266);
     assert.strictEqual(VIDEO_AREA.height, 240);
@@ -3533,14 +1488,15 @@ async function main() {
   });
 
   // ---------------- native 管线源码契约（player.c 是 C，单测只能查文本） ----------------
+
   // 这几条防的都是「改了不报错、真机上画面直接没了」的静默故障。
   const csrc = fsx.readFileSync(pathx.join(__dirname, '..', 'native', 'csrc', 'player.c'), 'utf8');
 
   test('native: 面板率常量是 1497/25（59.88Hz），不能写成 60/1', () => {
     // 面板实测 59.88Hz（modetest -c: #0 480x960 59.88）。写 60/1 会差 0.2%，
     // 长跑里每 ~8s 多出一帧，表现为周期性错拍。
-    assert.ok(/PENBILI_PANEL_RATE\s+"1497\/25"/.test(csrc), 'PENBILI_PANEL_RATE 必须是 "1497/25"');
-    assert.ok(!/PENBILI_PANEL_RATE\s+"60\/1"/.test(csrc), '不能退化成 60/1');
+    assert.ok(/PENDOUYU_PANEL_RATE\s+"1497\/25"/.test(csrc), 'PENDOUYU_PANEL_RATE 必须是 "1497/25"');
+    assert.ok(!/PENDOUYU_PANEL_RATE\s+"60\/1"/.test(csrc), '不能退化成 60/1');
   });
 
   test('native: caps 必须是一个 argv（拆开会拼出非法 caps）', () => {
@@ -3549,7 +1505,7 @@ async function main() {
     // caps 语法要求逗号 → `could not parse caps`，整条管线不建，
     // 真机表现是「日志里 erroneous pipeline、屏幕停在上一帧」。
     assert.ok(
-      /argv\[i\+\+\] = \(char \*\)"video\/x-raw,framerate=" PENBILI_PANEL_RATE;/.test(csrc),
+      /argv\[i\+\+\] = \(char \*\)"video\/x-raw,framerate=" PENDOUYU_PANEL_RATE;/.test(csrc),
       'framerate caps 必须与 video/x-raw 拼在同一个字符串里'
     );
     assert.ok(
@@ -3582,7 +1538,7 @@ async function main() {
     // 真机致命 bug（2026-10-31）：parse_fps_line 只向前扫数字，遇到 '.' 就停，
     // 于是 `29.97 fps` 被解析成 **97**。节拍器按 97fps 排程（10.3ms/帧）喂 30fps
     // 内容 → 画面 3.2 倍速快放，drift 飙到十几秒、skip 每秒几十次。
-    // 凡是 29.97 / 59.94 的稿件全中招（B站大量番剧/影视是 23.976/29.97）。
+    // 凡是 29.97 / 59.94 的源全中招（直播 FLV 常见 29.97 帧）。
     assert.ok(
       /q\[-1\] >= '0' && q\[-1\] <= '9'\) \|\| q\[-1\] == '\.'/.test(csrc) ||
         /\|\| q\[-1\] == '\.'/.test(csrc),
@@ -3625,7 +1581,7 @@ async function main() {
     // 画面必须定格等音频，而不是按名义帧率继续往前跑。
     // 关键约束：只对 DASH 拆流（audio_input[0]）生效 —— durl 单文件里音视频同进程，
     // 冻结视频读会反压 ffmpeg，音频就永远等不到，那才是真死锁。
-    assert.ok(/PENBILI_HOLD_MAX_MS/.test(csrc), '必须有定格门超时上限');
+    assert.ok(/PENDOUYU_HOLD_MAX_MS/.test(csrc), '必须有定格门超时上限');
     assert.ok(
       /s->writer_bytes <= 0[\s\S]{0,200}continue;/.test(csrc),
       '定格门必须在 writer_bytes<=0 时 continue（不读新帧）'
@@ -3658,15 +1614,15 @@ async function main() {
     // 修法：max-lateness=40（一帧 33ms 的 1.2 倍）+ qos=true。
     // 实测：旧配置峰值 417.84fps；新配置峰值 61.27fps 且**稳态 dropped 0**。
     assert.ok(
-      /#define PENBILI_MAX_LATENESS_MS 40/.test(csrc),
-      '必须有 PENBILI_MAX_LATENESS_MS 40'
+      /#define PENDOUYU_MAX_LATENESS_MS 40/.test(csrc),
+      '必须有 PENDOUYU_MAX_LATENESS_MS 40'
     );
     /* ⚠️ 宏必须定义在 render_start 之前：曾放在第 2196 行（render_start 在第 800 行用它），
      * 编译直接报 `use of undeclared identifier`。 */
-    const defineAt = csrc.indexOf('#define PENBILI_MAX_LATENESS_MS');
-    const useAt = csrc.indexOf('PENBILI_MAX_LATENESS_MS)');
+    const defineAt = csrc.indexOf('#define PENDOUYU_MAX_LATENESS_MS');
+    const useAt = csrc.indexOf('PENDOUYU_MAX_LATENESS_MS)');
     assert.ok(defineAt > 0 && useAt > 0, '宏定义与使用都必须存在');
-    assert.ok(defineAt < useAt, 'PENBILI_MAX_LATENESS_MS 必须定义在使用点之前');
+    assert.ok(defineAt < useAt, 'PENDOUYU_MAX_LATENESS_MS 必须定义在使用点之前');
     assert.ok(
       /no_late \? "false" : "true"/.test(csrc),
       'qos 必须默认 true（只有 /tmp/vp_nolate.on 才回退 false）'

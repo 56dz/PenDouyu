@@ -1,7 +1,9 @@
 # PenDouyu 集成契约（Lead 制定，各方必须遵守）
 
 项目：`PenDouyu`（X6 Pro 词典笔，Falcon 小程序，Vue + QuickJS）
-基线：从 `PenBili` 完整复制而来，B 站功能全部保留；新增斗鱼直播（主推）。
+基线：从 `PenBili` 完整复制而来，随后在 v2.0.0 剥离全部 B 站代码，只保留斗鱼直播。
+> 本文记录的是 v1.0.0 时期的集成约定，其中「保留 B 站」的条款已被 `docs/pure-douyu-refactor.md` 取代，
+> 仅作为历史与参数参考保留。
 主题：斗鱼橙 `#FF5D23`。布局沿用 PenBili（左栏 76px + 内容 884px；播放态 213:469:278）。
 
 ---
@@ -58,7 +60,7 @@ export async function searchLive(keyword)              // -> {items, via:'direct
 - 网络只能走 `src/services/net.js`（`$falcon.jsapi.http.request`，自定义头字段名是 `header` 单数，
   成功返回 `{result: body}`，非 2xx 返回 `{error:3, result:{errorMessage}}`）。
 - **不要**依赖 native form POST；GET 已验证可取流。
-- md5 直接用 `src/services/bili/md5.js`（已存在，勿重写）。
+- md5 直接用 `src/services/md5.js`（v2.0.0 起从 `services/bili/md5.js` 迁出）。
 - 每个函数必须 catch，返回 `{ok:false, error, errorText}` 或空数组，绝不 throw 到页面。
 - 不写 console.log 噪声；用 `storage.js` 的 `logWarn`。
 
@@ -91,7 +93,7 @@ souphttpsrc 直接 `Server does not accept Range HTTP header` 失败；实测多
 - 直播 desc 只写 `filesrc location="<fifo 路径>" blocksize=65536 ! flvdemux name=vd`，
   其余 pad-added 分支/queue/kmssink 逻辑**完全沿用 PenBili 直播分支**。
 - 停止/释放要 `kill(pid, SIGKILL)` + `waitpid` + `unlink(fifo)`。
-- 保留 B 站点播（ffmpeg→FIFO→matroskademux）与 B 站直播原逻辑不动。
+- ~~保留 B 站点播（ffmpeg→FIFO→matroskademux）与 B 站直播原逻辑不动。~~（v2.0.0 已删除全部 B 站链路）
 
 ## 5. 分区/写文件边界（避免冲突）
 

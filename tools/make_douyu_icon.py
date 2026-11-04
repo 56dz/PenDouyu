@@ -7,7 +7,10 @@ tools/make_icon_v2.js 依赖它），本机 python 也没有 Pillow。图标是�
 只需要一次高质量重采样，用 zlib 手工解 PNG + 可分离双线性放大即可。
 
 输入：.tmp_douyu_icon.png（74x74 RGBA，斗鱼官网 pcclient-desc 图）
-输出：app_icon.png（256x256 RGBA）
+输出：app_icon.png（256x256 RGBA，应用图标）
+      src/assets/icons/logo.png（60x60 RGBA，浏览态左栏 30x30 显示的软件 logo）
+
+两处都从同一张源图生成，保证「桌面图标」与「界面 logo」是同一个斗鱼鲨鱼。
 
 可分离双线性 = 先横向放大再纵向放大，两趟一维插值。74→256 是 3.46 倍，
 纯双线性会略糊；所以采用 **双线性 + 轻度 unsharp**（3x3 反锐化掩模），
@@ -20,7 +23,9 @@ import zlib
 
 SRC = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', '.tmp_douyu_icon.png')
 OUT = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'app_icon.png')
+LOGO = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'src', 'assets', 'icons', 'logo.png')
 SIZE = 256
+LOGO_SIZE = 60
 
 
 def read_png(path):
@@ -184,6 +189,12 @@ def main():
                 orange += 1
     print('out %dx%d bytes=%d opaque=%.1f%% orange=%.1f%%' %
           (SIZE, SIZE, n, 100.0 * opaque / total, 100.0 * orange / total))
+
+    # 界面 logo：同一源图缩到 60x60（界面按 30x30 显示，2x 出图防锯齿）
+    small = resize_bilinear(w, h, px, LOGO_SIZE, LOGO_SIZE)
+    small = unsharp(LOGO_SIZE, LOGO_SIZE, small)
+    ln = write_png(LOGO, LOGO_SIZE, LOGO_SIZE, small)
+    print('logo %dx%d bytes=%d -> %s' % (LOGO_SIZE, LOGO_SIZE, ln, LOGO))
     return 0
 
 

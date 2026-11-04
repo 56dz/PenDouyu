@@ -75,7 +75,7 @@ async function main() {
 
   // ---------- 0. 纯函数（不联网）----------
   hr('0. 纯函数自检');
-  const { md5Hex } = await import('../src/services/bili/md5.js');
+  const { md5Hex } = await import('../src/services/md5.js');
   // 签名公式对拍 doc §1：f = rand_str；循环 enc_time 次 f = md5(f + key)；
   //                        auth = md5(f + key + String(rid) + String(ts))
   const f1 = api.deriveSigningKey('RANDSTR', 'KEY', 3);

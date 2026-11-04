@@ -1,7 +1,6 @@
 {
   "pages": {
-    "index": "pages/index/index.js",
-    "diag": "pages/diag/diag.js"
+    "index": "pages/index/index.js"
   },
   "options": {
     "style": {

@@ -1,4 +1,4 @@
-// 纯 JS MD5（QuickJS 无 crypto 且 manifest bigNum=false；B 站 WBI 签名必需）。
+// 纯 JS MD5（QuickJS 无 crypto 且 manifest bigNum=false；斗鱼取流签名必需）。
 // 输入按 UTF-8 编码为字节流后做 MD5，返回小写 hex。
 // K 表直接内嵌标准常量（floor(abs(sin(i+1)) * 2^32)），避免 Math.sin 跨平台误差。
 // 测试：test/run.js 对拍 node crypto 与官方向量。

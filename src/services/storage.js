@@ -5,19 +5,14 @@
 
 const MEMORY = {};
 
+// 只保留底层读写原语 + 自检开关。斗鱼的持久化各自走独立 key：
+//   · douyu_did            —— 取流签名用的设备标识（douyu/api.js）
+//   · douyu_video_settings —— 画质偏好（video_settings.js）
+//   · douyu_player_impl    —— 播放器实现开关（player.js）
 export const KEYS = {
-  // 会话痕迹：buvid3/buvid4（B 站风险控制所需的匿名身份，非登录凭据）
-  session: 'bvp_session',
-  // 目标稿件覆盖（默认有内置值，可在 storage 里改）
-  settings: 'bvp_settings',
-  // 播放历史（给「我的」页；schema 见 history.js）
-  history: 'bili_history',
   // 自检开关（tools/seed_settings.js 预置，真机自动化用）
-  autotest: 'bili_autotest'
+  autotest: 'douyu_autotest'
 };
-
-export const SESSION_SCHEMA_VERSION = 2;
-export const SETTINGS_SCHEMA_VERSION = 1;
 
 function getSetPair(key) {
   const f = typeof $falcon !== 'undefined' ? $falcon : null;
@@ -131,81 +126,3 @@ export function setString(key, value) {
 export function memoryPeek(key) {
   return typeof MEMORY[key] === 'string' ? MEMORY[key] : '';
 }
-
-// ---- 会话 schema（version 化，读取时处理空值/损坏/旧版本）----
-// v1：匿名触点 {buvid3, buvid4}
-// v2：+ login（扫码登录态持久化：cookie 四件套 + 有效期 + 用户档案）
-//     任何 cookie 值只进 storage，**绝不进日志**
-// SESSION_SCHEMA_VERSION 见文件头
-export function normalizeLogin(lg) {
-  if (!lg || typeof lg !== 'object') return null;
-  const se = typeof lg.SESSDATA === 'string' ? lg.SESSDATA : '';
-  if (!se) return null;
-  return {
-    SESSDATA: se,
-    bili_jct: typeof lg.bili_jct === 'string' ? lg.bili_jct : '',
-    DedeUserID: typeof lg.DedeUserID === 'string' ? lg.DedeUserID : '',
-    DedeUserID__ckMd5: typeof lg['DedeUserID__ckMd5'] === 'string' ? lg['DedeUserID__ckMd5'] : '',
-    expiresAt: Number(lg.expiresAt) || 0,
-    mid: Number(lg.mid) || 0,
-    uname: typeof lg.uname === 'string' ? lg.uname : '',
-    level: Number(lg.level) || 0,
-    face: typeof lg.face === 'string' ? lg.face : '',
-    loggedAt: Number(lg.loggedAt) || 0
-  };
-}
-
-export function normalizeSession(raw) {
-  const empty = { version: SESSION_SCHEMA_VERSION, buvid3: '', buvid4: '', updatedAt: 0, login: null };
-  if (!raw || typeof raw !== 'object') return empty;
-  if (raw.version === 1) {
-    // v1 → v2 平移（v1 无登录概念）
-    return {
-      version: SESSION_SCHEMA_VERSION,
-      buvid3: typeof raw.buvid3 === 'string' ? raw.buvid3 : '',
-      buvid4: typeof raw.buvid4 === 'string' ? raw.buvid4 : '',
-      updatedAt: typeof raw.updatedAt === 'number' ? raw.updatedAt : 0,
-      login: null
-    };
-  }
-  if (raw.version !== SESSION_SCHEMA_VERSION) return empty;
-  return {
-    version: SESSION_SCHEMA_VERSION,
-    buvid3: typeof raw.buvid3 === 'string' ? raw.buvid3 : '',
-    buvid4: typeof raw.buvid4 === 'string' ? raw.buvid4 : '',
-    updatedAt: typeof raw.updatedAt === 'number' ? raw.updatedAt : 0,
-    login: normalizeLogin(raw.login)
-  };
-}
-
-export async function loadSession() {
-  return normalizeSession(await getJson(KEYS.session, null));
-}
-
-export function saveSession(session) {
-  return setJson(KEYS.session, normalizeSession(session));
-}
-
-// ---- 目标稿件设置 ----
-
-export const DEFAULT_TARGET = { bvid: 'BV1ZCeb6NEyM' };
-
-export function normalizeSettings(raw) {
-  const empty = {
-    version: SETTINGS_SCHEMA_VERSION,
-    bvid: DEFAULT_TARGET.bvid
-  };
-  if (!raw || typeof raw !== 'object') return empty;
-  if (raw.version !== SETTINGS_SCHEMA_VERSION) return empty;
-  const bvid = typeof raw.bvid === 'string' ? raw.bvid.trim() : '';
-  return {
-    version: SETTINGS_SCHEMA_VERSION,
-    bvid: /^BV[0-9A-Za-z]{10}$/.test(bvid) ? bvid : DEFAULT_TARGET.bvid
-  };
-}
-
-export async function loadSettings() {
-  return normalizeSettings(await getJson(KEYS.settings, null));
-}
-
-

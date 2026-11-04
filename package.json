@@ -2,9 +2,9 @@
   "name": "douyu-app",
   "appName": "PenDouyu",
   "appid": "8002026110200002",
-  "version": "1.0.0",
+  "version": "2.0.0",
   "icon": "app_icon.png",
-  "description": "PenDouyu（有道 X6 Pro）：斗鱼直播（分类/推荐/搜索 + 多码率切换）+ B 站（推荐/热门/搜索/播放/图文/登录），X6 Pro 走 MPP 硬解与 KMS 直出，蓝牙耳机音量镜像",
+  "description": "PenDouyu（有道 X6 Pro）：纯斗鱼直播客户端 —— 分类浏览、搜索、多码率切换，curl 命名管道拉流 + MPP 硬解 + KMS 直出，蓝牙耳机音量镜像",
   "quickjs": {
     "version": "20200705",
     "bigNum": false
@@ -29,15 +29,10 @@
     "falcon",
     "miniapp",
     "douyu",
-    "bilibili",
+    "live-streaming",
     "douyu-app"
   ],
   "dependencies": {
     "falcon-ui": "1.0.3"
-  },
-  "devDependencies": {
-    "@resvg/resvg-js": "^2.6.2",
-    "jsqr": "^1.4.0",
-    "qrcode": "^1.5.4"
   }
 }

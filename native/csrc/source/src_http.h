@@ -59,8 +59,8 @@
  * ============================ 调用约束 ============================
  * 全部只能在 worker 线程调用（会 fork/exec、会 open FIFO）。
  */
-#ifndef PENBILI_PB2_SRC_HTTP_H
-#define PENBILI_PB2_SRC_HTTP_H
+#ifndef PENDOUYU_PB2_SRC_HTTP_H
+#define PENDOUYU_PB2_SRC_HTTP_H
 
 #include <sys/types.h>
 
@@ -191,4 +191,4 @@ int pb2_src_reap_if_dead(pb2_src_t *s);
  */
 void pb2_src_cleanup_stale(void);
 
-#endif /* PENBILI_PB2_SRC_HTTP_H */
+#endif /* PENDOUYU_PB2_SRC_HTTP_H */

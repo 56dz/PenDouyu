@@ -18,8 +18,8 @@
  * 必须循环 read() 直到返回 <= 0 才能拿到 Esmart1-win0 那一段。
  * 用 cat 能看全是因为 shell 的 cat 自己循环读。
  */
-#ifndef PENBILI_PB2_KMS_PLANE_H
-#define PENBILI_PB2_KMS_PLANE_H
+#ifndef PENDOUYU_PB2_KMS_PLANE_H
+#define PENDOUYU_PB2_KMS_PLANE_H
 
 /* 播放用的平面窗口名（X6 Pro 上视频走 Esmart1-win0） */
 #define PB2_PLANE_WIN "Esmart1-win0"
@@ -45,4 +45,4 @@ int pb2_plane_query(void);
 int pb2_plane_cached(void);
 void pb2_plane_set_cached(int active);
 
-#endif /* PENBILI_PB2_KMS_PLANE_H */
+#endif /* PENDOUYU_PB2_KMS_PLANE_H */

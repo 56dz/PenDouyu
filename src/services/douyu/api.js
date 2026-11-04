@@ -24,10 +24,10 @@
 // 约束（doc §2）：所有函数 catch，绝不 throw；日志走 storage.js 的 logWarn。
 import { httpGet, tryParseJson } from '../net.js';
 import { logWarn, getString, setString, memoryPeek } from '../storage.js';
-import { md5Hex } from '../bili/md5.js';
+import { md5Hex } from '../md5.js';
 
 export const DOUYU_HOST = 'https://www.douyu.com';
-// 斗鱼风控只认浏览器 UA（与 B 站 client.js 的 Chrome 串同族，此处按 docs §1 的 Chrome/120 写死）
+// 斗鱼风控只认浏览器 UA（按 docs §1 实测可用的 Chrome/120 串写死，勿改）
 export const DOUYU_UA =
   'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
 export const DOUYU_REFERER = 'https://www.douyu.com/';
@@ -38,7 +38,7 @@ export const DEFAULT_RATE = 2; // 高清 900kbps，笔端最稳（doc §3）
 // GET 取流的 URL 长度软上限：实测约 900 字符；超过只告警不改变行为
 export const PLAY_URL_SOFT_LIMIT = 2000;
 
-export const DID_KEY = 'douyu_did'; // storage 独立 key，与 B 站 session 无关
+export const DID_KEY = 'douyu_did'; // 独立 storage key，与其它模块互不干扰
 
 export const ENCRYPTION_PATH = '/wgapi/livenc/liveweb/websec/getEncryption';
 

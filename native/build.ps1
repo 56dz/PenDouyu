@@ -5,7 +5,6 @@ $ErrorActionPreference = 'Stop'
 # Cross-compile native modules (zig toolchain):
 #   libjsapi_player.so   = player.c (v1 fallback: fb0 + aplay, X5 path)
 #   libjsapi_player2.so  = player2 (v2: in-process GStreamer/MPP/KMS, X6 Pro path)
-#   libjsapi_httpjson.so = httpjson.c (form POST raw body; bilibili TV login POST)
 # Output is packaged into the AMR libs/ by aiot-vue-cli as-is.
 #
 # ===== Target arch (confirm before build!) =====
@@ -13,9 +12,9 @@ $ErrorActionPreference = 'Stop'
 #   X6 Pro (melon_pro, fw4.3.5): aarch64 64-bit          -> loading 32-bit lib fails with
 #                                "wrong ELF class: ELFCLASS32:dlopen in dynamic_load_jsapi"
 # Default target: aarch64 (current daily driver is X6 Pro).
-# For X5: .\build.ps1 -Target arm   (or set env PENBILI_TARGET=arm|aarch64)
+# For X5: .\build.ps1 -Target arm   (or set env PENDOUYU_TARGET=arm|aarch64)
 if (-not $Target) {
-  $Target = if ($env:PENBILI_TARGET) { $env:PENBILI_TARGET } else { 'aarch64' }
+  $Target = if ($env:PENDOUYU_TARGET) { $env:PENDOUYU_TARGET } else { 'aarch64' }
 }
 if ($Target -ne 'aarch64' -and $Target -ne 'arm') { Write-Error "bad -Target: $Target" }
 
@@ -28,7 +27,7 @@ if (-not $zig) {
   if (Test-Path $cand) { $zig = $cand }
 }
 if (-not $zig -or -not (Test-Path $zig)) { Write-Error 'zig not found: set ZIG_EXE to zig.exe (ziglang.org, or pip install ziglang)' }
-$cache = if ($env:ZIG_CACHE) { $env:ZIG_CACHE } else { Join-Path $env:TEMP 'penbili-zig-cache' }
+$cache = if ($env:ZIG_CACHE) { $env:ZIG_CACHE } else { Join-Path $env:TEMP 'pendouyu-zig-cache' }
 $env:ZIG_GLOBAL_CACHE_DIR = $cache
 $env:ZIG_LOCAL_CACHE_DIR = $cache + '-local'
 
@@ -41,7 +40,7 @@ if ($Target -eq 'aarch64') {
   $triple = 'aarch64-linux-gnu.2.17'
   $stubDir = "$base\native\stubs-aarch64"
   # X6 Pro has no /dev/fb0: player.c drops the fbdev backend and uses the KMS overlay plane
-  $extra = @('-DPENBILI_KMS_ONLY=1')
+  $extra = @('-DPENDOUYU_KMS_ONLY=1')
   $buildPlayer2 = $true
   Write-Host "target = aarch64 (X6 Pro)"
 } else {
@@ -72,17 +71,6 @@ $zargs = $common + @(
   '-Wl,-soname,libjsapi_player.so'
 )
 & $zig @zargs
-if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-
-$hargs = $common + @(
-  '-o', "$base\libs\libjsapi_httpjson.so",
-  "$base\native\csrc\httpjson.c",
-  "$stubDir\libquickjs.so",
-  "$stubDir\libcurl.so.4",
-  '-lpthread',
-  '-Wl,-soname,libjsapi_httpjson.so'
-)
-& $zig @hargs
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
 # ---- player2 (v2): in-process GStreamer, X6 Pro only ----
@@ -116,7 +104,7 @@ if ($buildPlayer2) {
 Get-ChildItem "$base\libs\*.so" | Select-Object Name, Length
 # ELF structure / export check (mandatory before packaging into AMR)
 # inspect_elf.py validates EI_CLASS + e_machine per target: aarch64 must be ELFCLASS64/183
-$checkList = @('libjsapi_player.so', 'libjsapi_httpjson.so')
+$checkList = @('libjsapi_player.so')
 if ($buildPlayer2) { $checkList += 'libjsapi_player2.so' }
 foreach ($so in $checkList) {
   python "$base\tools\inspect_elf.py" "$base\libs\$so" --target $Target | Select-Object -Last 5

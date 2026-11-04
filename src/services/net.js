@@ -4,9 +4,12 @@
 //   - 成功 {result:<body>}（无 statusCode）；非 2xx {error:3,result:{errorMessage:'curl ... resCode:N'}}
 //     → 非 2xx 时 body 不可得，错误文本就是全部信息
 //   - 响应头永远不可见
-// 本项目只需要带自定义头的 GET JSON（B 站 api 必须自带浏览器 UA 过风控，见 profile）。
-
-import { logWarn } from './storage.js';
+// 本项目只需要带自定义头的 GET JSON（斗鱼接口必须自带浏览器 UA 过风控，见 douyu/api.js）。
+//
+// 纯斗鱼版本只保留这 5 个导出：httpGet / unwrapResponse / tryParseJson /
+// toRuntimeHeader / normalizeError。v1.x 的 native form POST（startPost/takeResult）、
+// 二进制 GET（弹幕 protobuf）与 native 文本 GET 全部随 B 站功能一起删除 —— 斗鱼所有接口
+// 都是普通 GET，jsapi.http 足够。
 
 function httpApi() {
   const f = typeof $falcon !== 'undefined' ? $falcon : null;
@@ -15,11 +18,6 @@ function httpApi() {
   if (jsapi.http && typeof jsapi.http.request === 'function') return jsapi.http;
   if (jsapi.net && typeof jsapi.net.request === 'function') return jsapi.net;
   return null;
-}
-
-export function netAvailable() {
-  const api = httpApi();
-  return !!(api && typeof api.request === 'function');
 }
 
 export function normalizeError(e) {
@@ -131,159 +129,4 @@ export function httpGet(url, opts) {
   });
 }
 
-// ---- 原生 form POST（native httpjson）----
-// B 站 TV 登录接口 GET=405、且必须原样 x-www-form-urlencoded body；
-// jsapi http 的 data 会被二次 JSON 序列化（真机实测）发不了 form → 只走 native。
-// 模块：libs/libjsapi_httpjson.so（同固件已验证；startPost 异步 + takeResult 轮询，不卡 JS）
-
-export function headersToLines(headers) {
-  const lines = [];
-  if (!headers) return '';
-  Object.keys(headers).forEach((k) => {
-    const v = headers[k];
-    if (typeof v === 'string' && v) lines.push(k + ': ' + v);
-  });
-  return lines.join('\r\n');
-}
-
-async function loadHttpJson() {
-  try {
-    const m = await import('httpjson');
-    const mod = m && (typeof m.startPost === 'function' ? m : m.default);
-    return mod || null;
-  } catch (e) {
-    return null;
-  }
-}
-
-// POST 原样 form body；opts: { headers, timeout } → {statusCode, body, errorMessage}
-export async function httpPostForm(url, body, opts) {
-  const o = opts || {};
-  const limit = o.timeout || 15000;
-  const mod = await loadHttpJson();
-  if (!mod) {
-    throw new Error('NET_NATIVE_MISSING: 缺少 libjsapi_httpjson.so（form POST 仅支持 native）');
-  }
-  const headerText = headersToLines(o.headers);
-  let id;
-  try {
-    id = mod.startPost(url, headerText, String(body == null ? '' : body), limit);
-  } catch (e) {
-    throw new Error('NET_NATIVE_START: ' + ((e && e.message) || e));
-  }
-  const t0 = Date.now();
-  return new Promise((resolve, reject) => {
-    const timer = setInterval(() => {
-      let raw = null;
-      try {
-        raw = mod.takeResult(id);
-      } catch (e) {
-        clearInterval(timer);
-        reject(new Error('NET_NATIVE_TAKE: ' + ((e && e.message) || e)));
-        return;
-      }
-      if (raw === null || raw === undefined) {
-        if (Date.now() - t0 > limit + 2000) {
-          clearInterval(timer);
-          reject(new Error('NET_TIMEOUT: form POST 超时(' + limit + 'ms)'));
-        }
-        return;
-      }
-      clearInterval(timer);
-      try {
-        const r = typeof raw === 'string' ? JSON.parse(raw) : raw;
-        if (!r) {
-          reject(new Error('NET_NATIVE_BAD_RESULT: 空结果'));
-          return;
-        }
-        if (!r.status && r.error) {
-          reject(new Error('NET_NATIVE: ' + r.error));
-          return;
-        }
-        resolve({
-          statusCode: Number(r.status) || 0,
-          body: typeof r.body === 'string' ? r.body : '',
-          errorMessage: r.error ? String(r.error) : ''
-        });
-      } catch (e) {
-        reject(new Error('NET_NATIVE_BAD_JSON: ' + ((e && e.message) || e)));
-      }
-    }, 150);
-  });
-}
-
-// 页面卸载时丢弃在途 native 请求（幂等）
-export async function cancelNativePosts() {
-  const mod = await loadHttpJson();
-  if (mod && typeof mod.cancelAll === 'function') {
-    try {
-      mod.cancelAll();
-    } catch (e) {
-      /* 幂等忽略 */
-    }
-  }
-}
-
-// 二进制 GET（弹幕 protobuf 等）：native httpjson getBinary → ArrayBuffer 原样返回。
-// jsapi http 实测把 1.2MB body 截成 2 字节（0x22…）不可用——只有 native curl 能保字节。
-// opts: { headers, timeout } → { statusCode, body:ArrayBuffer, errorMessage }（失败 throw 带 stage）
-export async function httpGetBinary(url, opts) {
-  const o = opts || {};
-  const limit = o.timeout || 15000;
-  const mod = await loadHttpJson();
-  if (!mod || typeof mod.getBinary !== 'function') {
-    const err = new Error('NET_NATIVE_MISSING: libjsapi_httpjson.so 无 getBinary（需重编升级）');
-    err.stage = 'transport';
-    throw err;
-  }
-  let r;
-  try {
-    r = mod.getBinary(url, headersToLines(o.headers), limit);
-  } catch (e) {
-    const err = new Error('NET_NATIVE_GET: ' + ((e && e.message) || e));
-    err.stage = 'transport';
-    throw err;
-  }
-  if (!r || !r.ok) {
-    const err = new Error('HTTP ' + (r && r.status ? r.status : 0) + (r && r.error ? ': ' + r.error : ''));
-    err.stage = 'http';
-    throw err;
-  }
-  return { statusCode: r.status, body: r.buf, errorMessage: '' };
-}
-
-// QuickJS 无 TextDecoder：手写 UTF-8 → JS 字符串（含 4 字节代理对）
-export function utf8Decode(buf) {
-  const u = new Uint8Array(buf);
-  let out = '';
-  let i = 0;
-  const n = u.length;
-  while (i < n) {
-    const c = u[i];
-    if (c < 0x80) {
-      out += String.fromCharCode(c);
-      i++;
-    } else if ((c & 0xe0) === 0xc0 && i + 1 < n) {
-      out += String.fromCharCode(((c & 0x1f) << 6) | (u[i + 1] & 0x3f));
-      i += 2;
-    } else if ((c & 0xf0) === 0xe0 && i + 2 < n) {
-      out += String.fromCharCode(((c & 0x0f) << 12) | ((u[i + 1] & 0x3f) << 6) | (u[i + 2] & 0x3f));
-      i += 3;
-    } else if ((c & 0xf8) === 0xf0 && i + 3 < n) {
-      const cp = ((c & 0x07) << 18) | ((u[i + 1] & 0x3f) << 12) | ((u[i + 2] & 0x3f) << 6) | (u[i + 3] & 0x3f);
-      out += String.fromCharCode(0xd800 + ((cp - 0x10000) >> 10), 0xdc00 + ((cp - 0x10000) & 0x3ff));
-      i += 4;
-    } else {
-      i++; // 非法字节跳过
-    }
-  }
-  return out;
-}
-
-// native libcurl 文本 GET（返回 {statusCode, body:string, errorMessage}，与 jsapi http 响应同构）。
-// 用途：article/view 等对 TLS/HTTP 指纹风控敏感的接口——jsapi.http 栈会吃 -352，libcurl 栈可过
-//（2026-10-04 笔上对拍：同签名 URL，curl code=0，jsapi.http -352）。
-export async function httpGetTextNative(url, opts) {
-  const r = await httpGetBinary(url, opts);
-  return { statusCode: r.statusCode, body: utf8Decode(r.body), errorMessage: r.errorMessage };
-}
+// logWarn 目前未被本文件使用，但保留导入会触发打包器告警，故不导入。

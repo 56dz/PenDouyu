@@ -6,8 +6,8 @@
 
 用法：
   python tools/seed_prefs.py --show
-  python tools/seed_prefs.py --set 'bili_autotest={"enabled":true,"liveOnly":true,"liveRoom":<房间号>}'
-  python tools/seed_prefs.py --delete bili_autotest
+  python tools/seed_prefs.py --set 'douyu_autotest={"enabled":true,"liveOnly":true,"liveRoom":<房间号>}'
+  python tools/seed_prefs.py --delete douyu_autotest
   # 改完必须杀掉小程序再启动（存活实例不会重挂载）：
   #   adb shell "kill -9 $(pidof miniapp)" ; adb shell miniapp_cli install /tmp/x.amr ; adb shell miniapp_cli start <appid> --index
 """
@@ -17,9 +17,9 @@ import os
 import subprocess
 import sys
 
-APPID = "8002026110200001"
+APPID = "8002026110200002"
 REMOTE = "/userdisk/miniapp/data/mini_app/pkg/%s/data/sharedpreferences/preferences.json" % APPID
-ADB = os.environ.get("ADB", r"D:\Program Files\YoudaoPenToolbox\adb.exe")
+ADB = os.environ.get("ADB", os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "env", "adb", "adb.exe"))
 
 
 def adb(args, stdin=None):

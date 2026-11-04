@@ -13,8 +13,8 @@
  *   - 唯一可以自己定义的是 GError（3 个字段顺序在 aarch64 上已实测固定）。
  *   - 常量值全部来自 gst 官方头文件的稳定 ABI，不可改动。
  */
-#ifndef PENBILI_GST_MIN_H
-#define PENBILI_GST_MIN_H
+#ifndef PENDOUYU_GST_MIN_H
+#define PENDOUYU_GST_MIN_H
 
 #include <stddef.h>
 
@@ -202,4 +202,4 @@ extern void g_free(void *mem);
 }
 #endif
 
-#endif /* PENBILI_GST_MIN_H */
+#endif /* PENDOUYU_GST_MIN_H */

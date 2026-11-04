@@ -4,8 +4,8 @@
  * 所有计时都用 CLOCK_MONOTONIC，绝不用 gettimeofday（会被 NTP 跳变影响，
  * 旧代码用 wall clock 算 fps 导致长跑后 fps 抖动）。
  */
-#ifndef PENBILI_PB2_CLOCK_H
-#define PENBILI_PB2_CLOCK_H
+#ifndef PENDOUYU_PB2_CLOCK_H
+#define PENDOUYU_PB2_CLOCK_H
 
 #include <stddef.h>
 
@@ -43,4 +43,4 @@ int pb2_screen_off(void);
  * 返回读到的字节数，失败返回 -1。不做循环 read（这类文件都是一次读完）。 */
 int pb2_read_small_file(const char *path, char *buf, size_t cap);
 
-#endif /* PENBILI_PB2_CLOCK_H */
+#endif /* PENDOUYU_PB2_CLOCK_H */

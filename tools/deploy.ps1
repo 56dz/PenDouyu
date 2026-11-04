@@ -1,6 +1,6 @@
 ﻿# PenDouyu 真机部署与验证（有道 X6 Pro）
 #
-# 与 PenBili 的 tools/deploy.ps1 同构，差别只在 appid / 包名 / 日志标签 / 残留指纹。
+# 流程与 PenBili 时期同构，差别在 appid / 包名 / 日志标签 / 残留指纹。
 #
 # 流程：
 #   1) 设备与产物检查（AMR + native ELF）
@@ -38,11 +38,13 @@ function Pull-Capture([string]$remote, [string]$local) {
   if (Test-Path $local) { Write-Host "evidence: $local" } else { Write-Host "MISSING: $local" -ForegroundColor Yellow }
 }
 
-# 直播拉流走 curl 子进程写 FIFO，所以残留检查看 curl / FIFO，而不是 ffmpeg / aplay
+# 直播拉流走 curl 子进程写 FIFO，所以残留检查看 curl / FIFO，而不是 ffmpeg / aplay。
+# FIFO 必须用 find -type p 数：/tmp/pb2/err-<name>.fifo 是**普通文件**（curl stderr 重定向），
+# 用 `ls *.fifo | wc -l` 会把它们算进去，永远报 8 个假残留（真机踩过）。
 function Residue() {
   $c = & $adb shell "ps | grep -c '[c]url -s'"
   $f = & $adb shell "ps | grep -c '[f]fmpeg'"
-  $fifo = & $adb shell "ls /tmp/pb2/*.fifo 2>/dev/null | wc -l"
+  $fifo = & $adb shell "find /tmp/pb2 -maxdepth 1 -type p 2>/dev/null | wc -l"
   Write-Host "残留: curl=$c ffmpeg=$f fifo=$fifo (期望 0/0/0)"
 }
 
@@ -55,7 +57,7 @@ $amr = Get-ChildItem -Path $root -Filter 'PenDouyu*.amr' | Sort-Object LastWrite
 if (-not $amr) { $amr = Get-ChildItem -Path $root -Filter "$appid.*.amr" | Sort-Object LastWriteTime -Descending | Select-Object -First 1 }
 if (-not $amr) { throw '找不到 AMR 包，请先 npm run build' }
 Write-Host "AMR: $($amr.Name) ($([math]::Round($amr.Length/1KB,1)) KB)"
-foreach ($so in @('libjsapi_player.so', 'libjsapi_httpjson.so', 'libjsapi_player2.so')) {
+foreach ($so in @('libjsapi_player.so', 'libjsapi_player2.so')) {
   $p = Join-Path $root "libs\$so"
   if (Test-Path $p) { python (Join-Path $root 'tools\inspect_elf.py') $p --target aarch64 | Select-Object -Last 3 }
 }

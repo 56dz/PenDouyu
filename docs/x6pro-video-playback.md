@@ -36,7 +36,7 @@
 
 X5 的 `fb_open()` 读 `/sys/class/graphics/fb0/*` 后 `mmap` `/dev/fb0` 逐行 memcpy，
 在 X6 Pro 上第一句就失败（老代码会返回 `"/dev/fb0 打开失败（需要 32bpp 且可写）"`）。
-因此 X6 构建用 `-DPENBILI_KMS_ONLY=1` 把整段 fbdev 探测编译掉，改用 DRM/KMS 硬件叠加平面。
+因此 X6 构建用 `-DPENDOUYU_KMS_ONLY=1` 把整段 fbdev 探测编译掉，改用 DRM/KMS 硬件叠加平面。
 
 ## 2. 屏幕几何：逻辑面 ≠ 面板
 
@@ -177,7 +177,7 @@ else if (d0 < 0) adj = -1;
 **约每秒一次的顿挫**。实测相邻两次上屏的最大间隔 126ms；改节拍器后降到 30~33ms
 （正好一帧），`video_skips` 从 544 降到 2，音画漂移稳定在 ±60ms 内。
 
-诊断开关：`export PENBILI_VID_DIAG=1` 后 `video_thread()` 每秒往 `/tmp/vp_vid.log`
+诊断开关：`export PENDOUYU_VID_DIAG=1` 后 `video_thread()` 每秒往 `/tmp/vp_vid.log`
 落一行 `t/n/fps/wait/maxwait/wgap/rdgap/augap/fifo/sk/drift/aulen/st`（上限 300 行），
 默认关闭。`wgap` 就是「上屏最大空档」，排查卡顿先看它。
 
@@ -336,12 +336,12 @@ aplay -D 'bluealsa:DEV=B0:A3:F2:AD:7E:FA,PROFILE=a2dp' \
 pwsh native/build.ps1
 # X5 / 32 位
 pwsh native/build.ps1 -Target arm
-# 或 PENBILI_TARGET=arm
+# 或 PENDOUYU_TARGET=arm
 ```
 
 aarch64 用 `zig cc -target aarch64-linux-gnu.2.17` + `native/stubs-aarch64/`
 （`libquickjs.so`、`libcurl.so.4` 等 ELF64 空实现 stub，仅提供符号，不参与运行），
-并带 `-DPENBILI_KMS_ONLY=1`。构建脚本末尾自动跑
+并带 `-DPENDOUYU_KMS_ONLY=1`。构建脚本末尾自动跑
 `python tools/inspect_elf.py <so> --target <t>` 校验
 （`arm` → class 1 / machine 40，`aarch64` → class 2 / machine 183），不匹配直接 exit 1。
 
@@ -351,8 +351,9 @@ aarch64 用 `zig cc -target aarch64-linux-gnu.2.17` + `native/stubs-aarch64/`
 # 平面状态：谁是 ACTIVE、谁是 fb=0
 grep -a -A9 'Esmart' /sys/kernel/debug/dri/0/summary
 
-# 当前播放子进程（player2 只起 ffmpeg 拉流，gst 在进程内）
-grep -a 'ffmpeg' /proc/*/cmdline 2>/dev/null
+# 当前播放子进程：直播是 curl（写 FIFO），点播才是 ffmpeg（PenDouyu 已无点播）；gst 在进程内
+grep -a 'curl\|ffmpeg' /proc/*/cmdline 2>/dev/null
+cat /tmp/pb2/argv-curl.txt 2>/dev/null   # curl 的完整 argv（排查 UA/Referer 串站）
 
 # player2 日志（需先建开关文件；默认关闭）
 touch /tmp/pb2.enable && tail -40 /tmp/pb2.log
@@ -361,7 +362,7 @@ touch /tmp/pb2.enable && tail -40 /tmp/pb2.log
 hal-screen on; hal-screen keep
 
 # 日志一律 grep -a：文件含二进制字节，普通 grep 返回空
-grep -a '\[bili\]' /userdata/applog/DictPen_*.log | tail -40
+grep -a '\[douyu\]' /userdata/applog/DictPen_*.log | tail -40
 ```
 
 > v1 专用的 `/tmp/vp_trend.log` / `/tmp/vp_vid.log` 只在 `player.c` 下产生；

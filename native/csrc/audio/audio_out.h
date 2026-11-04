@@ -19,8 +19,8 @@
  * pb2_audio_prepare() 会 fork/exec amixer，耗时 10~200ms，
  * **只能在 worker 线程调用**，绝不能在 JSAPI 线程。
  */
-#ifndef PENBILI_PB2_AUDIO_OUT_H
-#define PENBILI_PB2_AUDIO_OUT_H
+#ifndef PENDOUYU_PB2_AUDIO_OUT_H
+#define PENDOUYU_PB2_AUDIO_OUT_H
 
 /*
  * 音频路由准备。
@@ -67,4 +67,4 @@ int pb2_audio_external_present(void);
  */
 void pb2_audio_restore(void);
 
-#endif /* PENBILI_PB2_AUDIO_OUT_H */
+#endif /* PENDOUYU_PB2_AUDIO_OUT_H */

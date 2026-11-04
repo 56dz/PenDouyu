@@ -195,7 +195,7 @@ export function runLiveEndCases() {
 
   // 引擎指纹：一旦在真机与 Node 上不一致，说明判据依赖了引擎特性，需要重写
   lines.push(
-    '[bili] LIVE-END PROBE engine typeof(Number)=' + typeof Number +
+    '[douyu] LIVE-END PROBE engine typeof(Number)=' + typeof Number +
       " Number('17')=" + Number('17') +
       ' typeof(NaN)=' + typeof NaN +
       ' isFinite(1/0)=' + isFinite(1 / 0) +
@@ -216,7 +216,7 @@ export function runLiveEndCases() {
       // 判据抛错本身就是缺陷（必须是纯函数、对脏输入不崩），记为失败
       fail++;
       const msg = '#' + (i + 1) + ' ' + c.name + ' THROW ' + ((e && e.message) || e);
-      lines.push('[bili] LIVE-END PROBE ' + msg);
+      lines.push('[douyu] LIVE-END PROBE ' + msg);
       failures.push(msg);
       continue;
     }
@@ -227,12 +227,12 @@ export function runLiveEndCases() {
       '#' + (i + 1) + ' ' + c.name + ' ' + (ok ? 'PASS' : 'FAIL') +
       ' got=' + got + ' want=' + c.want +
       (ok ? '' : '  ← ' + c.why);
-    lines.push('[bili] LIVE-END PROBE ' + row);
+    lines.push('[douyu] LIVE-END PROBE ' + row);
     if (!ok) failures.push(row);
   }
 
   lines.push(
-    '[bili] LIVE-END PROBE ' + (fail === 0 ? 'PASS' : 'FAIL') +
+    '[douyu] LIVE-END PROBE ' + (fail === 0 ? 'PASS' : 'FAIL') +
       ' passed=' + pass + ' failed=' + fail + ' total=' + (pass + fail)
   );
   return { pass: pass, fail: fail, lines: lines, failures: failures };

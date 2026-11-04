@@ -16,7 +16,7 @@
 //    直接拼 `.jpg` 会 404（实测）。
 //
 // 3) 协议：rpic/apic.douyucdn.cn 的 http 与 https 实测都 200，但框架 ImageLoader 基于 curl
-//    且不带回环 CA 库（见 services/imgurl.js 的结论）→ 统一降 http，避免 https 失败成灰块。
+//    且不带回环 CA 库 → 统一降 http，避免 https 失败成灰块。
 import { logWarn } from '../storage.js';
 
 // 图片 CDN 域名（只对这两个域名做 http 降级/路径归一，其它外链不动）
