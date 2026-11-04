@@ -1,10 +1,10 @@
 {
-  "name": "bili-app",
-  "appName": "PenBili",
-  "appid": "8002026110200001",
-  "version": "3.5.4",
+  "name": "douyu-app",
+  "appName": "PenDouyu",
+  "appid": "8002026110200002",
+  "version": "1.0.0",
   "icon": "app_icon.png",
-  "description": "PenBili（有道 X6 Pro）：推荐/热门 + 视频/图文/直播三栏搜索 + DASH 播放与直播间直连（X6 Pro 走 MPP 硬解）+ 图文阅读 + 点赞投币收藏 + 评论区 + 扫码登录",
+  "description": "PenDouyu（有道 X6 Pro）：斗鱼直播（分类/推荐/搜索 + 多码率切换）+ B 站（推荐/热门/搜索/播放/图文/登录），X6 Pro 走 MPP 硬解与 KMS 直出，蓝牙耳机音量镜像",
   "quickjs": {
     "version": "20200705",
     "bigNum": false
@@ -20,7 +20,7 @@
     "build:prod": "node ../env/node_modules/aiot-vue-cli/src/cli.js -c -q -p",
     "native": "powershell -NoProfile -ExecutionPolicy Bypass -File native/build.ps1",
     "test": "node test/run.js",
-    "icon": "python tools/make_icon_v2.py favicon.ico tools/icon_colors.json && node tools/make_icon_v2.js",
+    "icon": "python tools/make_douyu_icon.py",
     "deploy": "powershell -NoProfile -ExecutionPolicy Bypass -File tools/deploy.ps1"
   },
   "keywords": [
@@ -28,8 +28,9 @@
     "dictionary-pen",
     "falcon",
     "miniapp",
+    "douyu",
     "bilibili",
-    "bili-app"
+    "douyu-app"
   ],
   "dependencies": {
     "falcon-ui": "1.0.3"

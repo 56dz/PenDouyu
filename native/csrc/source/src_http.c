@@ -77,6 +77,12 @@ static char *g_min_env[] = {(char *)"PATH=/usr/bin:/bin:/sbin:/usr/sbin",
 #define PB2_FFMPEG "/usr/bin/ffmpeg"
 #define PB2_FFMPEG_ALT "/bin/ffmpeg"
 #define PB2_FFPROBE "/usr/bin/ffprobe"
+/*
+ * 直播用设备自带的 curl（见 src_http.h 的 pb2_src_open_live 注释：
+ * 只有 `curl -o <fifo>` 这一条路在真机上被验证可行，stdout 管道是坏的）。
+ */
+#define PB2_CURL "/bin/curl"
+#define PB2_CURL_ALT "/usr/bin/curl"
 
 /* 关键帧探测的单条缓存（见 probe_video_keyframe_ms 顶部注释） */
 static char g_kf_input[768];
@@ -716,6 +722,154 @@ int pb2_src_open(pb2_src_t *s, const char *input, const char *input2, const char
     return 0;
 }
 
+/* ==================== 直播：fork curl 写 FIFO ==================== */
+
+/* URL 的 host 是否属于斗鱼（决定要不要加 Origin 头）。 */
+static int url_host_is_douyu(const char *url) {
+    const char *p;
+    if (!url) return 0;
+    p = strstr(url, "://");
+    p = p ? p + 3 : url;
+    return strstr(p, "douyu") != NULL || strstr(p, "douyucdn") != NULL;
+}
+
+/*
+ * 起 curl 写 FIFO。
+ *
+ * 【必须用 -o <fifo>，不能靠 stdout 重定向】
+ *   设备实测：`curl URL | cat` 得 0 字节，`curl -v | cat` 报 `curl: (3) Error`
+ *   —— 这个固件上 curl 的 stdout 管道是坏的。`curl -s URL -o <fifo>` 正常。
+ *   虽然 posix_spawn 的 addopen(STDOUT) 与 shell 管道不是同一件事，但既然
+ *   唯一被真机验证过的是 -o，就以 -o 为准，同时把 stdout 也指到 FIFO 当作
+ *   双保险（curl 用了 -o 之后不再写 stdout，多指一个写端无害）。
+ */
+static pid_t spawn_curl(const char *fifo, const char *url, const char *ua, const char *ref) {
+    posix_spawn_file_actions_t fa;
+    char *argv[24];
+    char errfile[160];
+    pid_t pid = -1;
+    int n = 0;
+
+    argv[n++] = (char *)PB2_CURL;
+    argv[n++] = (char *)"-s";
+    argv[n++] = (char *)"-L";
+    argv[n++] = (char *)"--connect-timeout";
+    argv[n++] = (char *)"8";
+    /*
+     * --speed-limit/--speed-time：20 秒内平均速率低于 1KB/s 就自己退出。
+     * 直播最容易出现的故障是「连接还在、CDN 不再推数据」，没有这个选项
+     * curl 会永远挂着，上层的存活探测看到进程活着、画面却永远不动。
+     */
+    argv[n++] = (char *)"--speed-limit";
+    argv[n++] = (char *)"1024";
+    argv[n++] = (char *)"--speed-time";
+    argv[n++] = (char *)"20";
+    argv[n++] = (char *)"-o";
+    argv[n++] = (char *)fifo;
+    if (ua && ua[0]) {
+        argv[n++] = (char *)"-A";
+        argv[n++] = (char *)ua;
+    }
+    if (ref && ref[0]) {
+        argv[n++] = (char *)"-e";
+        argv[n++] = (char *)ref;
+    }
+    /*
+     * Origin 只对斗鱼加：斗鱼 CDN 的部分边缘节点会校验它，B 站 CDN 不需要，
+     * 而给 B 站发一个 douyu 的 Origin 只会让排查日志更难读。
+     */
+    if (url_host_is_douyu(url)) {
+        argv[n++] = (char *)"-H";
+        argv[n++] = (char *)"Origin: https://www.douyu.com";
+    }
+    argv[n++] = (char *)url;
+    argv[n] = NULL;
+
+    log_argv("curl", argv);
+    dump_argv_full("curl", argv);
+
+    {
+        int r1 = posix_spawn_file_actions_init(&fa);
+        /* 双保险：即使 -o 因为某些原因没生效，stdout 也是同一条 FIFO */
+        int r2 = posix_spawn_file_actions_addopen(&fa, STDOUT_FILENO, fifo, O_WRONLY, 0);
+        int r3;
+        int r4;
+        {
+            const char *base = strrchr(fifo, '/');
+            snprintf(errfile, sizeof(errfile), "%s/err-%s", PB2_SRC_DIR,
+                     base ? base + 1 : fifo);
+        }
+        /* 诊断：curl 的 stderr 落盘，排查 403 / 掐流看这里 */
+        r3 = posix_spawn_file_actions_addopen(&fa, STDERR_FILENO, errfile,
+                                              O_WRONLY | O_CREAT | O_TRUNC, 0600);
+        r4 = posix_spawn_file_actions_addopen(&fa, STDIN_FILENO, "/dev/null", O_RDONLY, 0);
+        if (r1 || r2 || r3 || r4) {
+            pb2_logf("src: curl file_actions failed init=%d out=%d err=%d in=%d", r1, r2, r3,
+                     r4);
+        }
+    }
+
+    {
+        char **envp = environ;
+        const char *env_how = "host";
+        if (!envp || !envp[0] || !strchr(envp[0], '=')) {
+            envp = g_min_env;
+            env_how = "min";
+        }
+        int rc = posix_spawn(&pid, PB2_CURL, &fa, NULL, argv, envp);
+        if (rc != 0) {
+            argv[0] = (char *)PB2_CURL_ALT;
+            rc = posix_spawn(&pid, PB2_CURL_ALT, &fa, NULL, argv, envp);
+        }
+        posix_spawn_file_actions_destroy(&fa);
+        if (rc != 0) {
+            pb2_logf("src: posix_spawn curl failed rc=%d (%s) errno=%d (%s) env=%s", rc,
+                     strerror(rc), errno, strerror(errno), env_how);
+            return -1;
+        }
+    }
+
+    pb2_logf("src: curl pid=%d fifo=%s ua=%s ref=%s", (int)pid, fifo,
+             (ua && ua[0]) ? ua : "(default)", (ref && ref[0]) ? ref : "(none)");
+    return pid;
+}
+
+int pb2_src_open_live(pb2_src_t *s, const char *url, const char *ua, const char *ref) {
+    if (!s || !url || !url[0]) return -1;
+    memset(s, 0, sizeof(*s));
+    s->hold_fd = -1;
+    s->hold_fd2 = -1;
+    s->baseMs = 0; /* 直播永远不可 seek，位置基准由 session 自己算 */
+
+    if (!is_http(url)) {
+        pb2_logf("src: live requires http(s) url, got: %.64s", url);
+        return -1;
+    }
+
+    ensure_dir();
+    /* 前缀 dy- 与点播的 pb2- 区分，便于日志与残留清理时肉眼分辨 */
+    snprintf(s->fifo, sizeof(s->fifo), "%s/dy-%d-%d.fifo", PB2_SRC_DIR, (int)getpid(),
+             ++g_seq);
+    s->hold_fd = make_fifo(s->fifo, sizeof(s->fifo));
+    if (s->hold_fd < 0) return -1;
+
+    s->pid = spawn_curl(s->fifo, url, ua, ref);
+    if (s->pid <= 0) {
+        close(s->hold_fd);
+        s->hold_fd = -1;
+        unlink(s->fifo);
+        s->fifo[0] = '\0';
+        return -1;
+    }
+
+    snprintf(s->location, sizeof(s->location), "%s", s->fifo);
+    s->is_http = 1;
+    s->is_live = 1;
+    s->active = 1;
+    pb2_logf("src: live fifo %s (curl pid=%d)", s->fifo, (int)s->pid);
+    return 0;
+}
+
 /* 并行回收两个 ffmpeg 进程：SIGTERM 后最多等 PB2_REAP_GRACE_MS，再 SIGKILL
  *
  * 【P1-3 修复要点】
@@ -746,7 +900,7 @@ static int pid_alive(pid_t pid) {
  * 这里改成：两条 SIGTERM 一次发完 → 同一个循环里同时观察两个 pid →
  * 任一超过宽限才单独 SIGKILL。最坏情况耗时等于"一个"进程的回收时间。
  */
-static void reap_pair(pid_t a, pid_t b) {
+static void reap_pair_ex(pid_t a, pid_t b, int hard_kill) {
     int st = 0;
     int a_done = (a <= 0);
     int b_done = (b <= 0);
@@ -757,8 +911,27 @@ static void reap_pair(pid_t a, pid_t b) {
 
     if (a_done && b_done) return;
 
-    if (!a_done) kill(a, SIGTERM);
-    if (!b_done) kill(b, SIGTERM);
+    /*
+     * 【直播必须直接 SIGKILL】
+     * curl 收到 SIGTERM 会先把自己缓冲里的数据写完再退出。点播这样是对的
+     * （ffmpeg 有机会 flush 掉结尾），但直播没有结尾、也没有人再读 FIFO，
+     * 于是 SIGTERM 只会白等一个宽限窗口才升级成 SIGKILL —— 每次切台/停止
+     * 都多几十毫秒。直播直接 SIGKILL（docs 第 4 节的要求）。
+     */
+    if (hard_kill) {
+        if (!a_done) {
+            kill(a, SIGKILL);
+            a_killed = 1;
+        }
+        if (!b_done) {
+            kill(b, SIGKILL);
+            b_killed = 1;
+        }
+        kill_at = t0; /* 已经在 SIGKILL 阶段，不再等宽限 */
+    } else {
+        if (!a_done) kill(a, SIGTERM);
+        if (!b_done) kill(b, SIGTERM);
+    }
 
     for (;;) {
         long long now = pb2_now_ms();
@@ -798,15 +971,23 @@ static void reap_pair(pid_t a, pid_t b) {
             nanosleep(&ts, NULL);
         }
     }
-    pb2_logf("src: reap pair %d/%d took %lldms (killed=%d/%d)", (int)a, (int)b,
-             pb2_now_ms() - t0, a_killed, b_killed);
+    pb2_logf("src: reap pair %d/%d took %lldms (killed=%d/%d hard=%d)", (int)a, (int)b,
+             pb2_now_ms() - t0, a_killed, b_killed, hard_kill);
 }
+
+/* 点播默认用 SIGTERM 起步（ffmpeg 需要机会 flush） */
+static void reap_pair(pid_t a, pid_t b) { reap_pair_ex(a, b, 0); }
 
 void pb2_src_close(pb2_src_t *s) {
     if (!s) return;
-    /* 【P1-3】两个 ffmpeg 并行 kill，然后统一回收：不再一个 200ms、一个 200ms */
-    reap_pair(s->pid, s->pid2);
-    if (s->pid > 0) pb2_logf("src: ffmpeg pid=%d closed", (int)s->pid);
+    /*
+     * 【P1-3】两个 ffmpeg 并行 kill，然后统一回收：不再一个 200ms、一个 200ms。
+     * 直播源（curl）直接 SIGKILL，理由见 reap_pair_ex。
+     */
+    reap_pair_ex(s->pid, s->pid2, s->is_live);
+    if (s->pid > 0) {
+        pb2_logf("src: %s pid=%d closed", s->is_live ? "curl" : "ffmpeg", (int)s->pid);
+    }
     s->pid = 0;
     if (s->pid2 > 0) pb2_logf("src: ffmpeg pid2=%d closed", (int)s->pid2);
     s->pid2 = 0;
@@ -942,10 +1123,12 @@ void pb2_src_cleanup_stale(void) {
         int pid = 0;
         char seq[32];
         char path[PB2_SRC_FIFO_MAX];
-        /* 只认 pb2-<pid>-<seq>.fifo / pb2-<pid>-<seq>-v.fifo / -a.fifo */
+        /* 只认 pb2-<pid>-<seq>.fifo / pb2-<pid>-<seq>-v.fifo / -a.fifo /
+         * dy-<pid>-<seq>.fifo（直播的 curl FIFO） */
         if (sscanf(de->d_name, "pb2-%d-%31[0-9].fifo", &pid, seq) != 2 &&
             sscanf(de->d_name, "pb2-%d-%31[0-9]-v.fifo", &pid, seq) != 2 &&
-            sscanf(de->d_name, "pb2-%d-%31[0-9]-a.fifo", &pid, seq) != 2) {
+            sscanf(de->d_name, "pb2-%d-%31[0-9]-a.fifo", &pid, seq) != 2 &&
+            sscanf(de->d_name, "dy-%d-%31[0-9].fifo", &pid, seq) != 2) {
             continue;
         }
         if (pid == (int)getpid()) continue; /* 自己的由 pb2_src_close 负责 */

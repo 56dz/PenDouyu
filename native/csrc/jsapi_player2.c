@@ -432,7 +432,7 @@ static JSValue js_set_rect(JSContext *ctx, JSValueConst this_val, int argc, JSVa
  *   - **直播完全无效** —— do_seek() 对直播是早退的，于是 index.vue 的两个
  *     stall 看门狗（8000ms / 25000ms）触发 3 次配额全打空转，
  *     用户看到「画面冻住、进度条还在走、点哪里都没反应，只能返回列表重进」。
- * 现在 native 直接提供入口：直播重拉 souphttpsrc，点播投递原地 seek。
+ * 现在 native 直接提供入口：直播重建管线并重开 curl，点播投递原地 seek。
  */
 static JSValue js_recover(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
     (void)this_val; (void)argc; (void)argv;

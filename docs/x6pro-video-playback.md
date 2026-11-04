@@ -1,5 +1,10 @@
 # X6 Pro 视频播放链路（KMS overlay）与音频通路
 
+> **来源说明**：本文随 PenDouyu 从 [PenBili](https://github.com/56dz/PenBili) 继承而来，
+> 同样记录的是**平台层事实**（KMS overlay、音频通路、`amixer` 解析坑），斗鱼直播沿用同一套
+> 播放底座，所以原样保留。PenDouyu 新增的部分见 [`douyu-integration.md`](douyu-integration.md)
+> 与 [`../README.md`](../README.md) 的「拉流：为什么最后是 curl + 命名管道」。
+
 > **阅读提示（v3.5.2 起）**：当前默认播放实现是 **player2**（`native/csrc/jsapi_player2.c`
 > + `session/`、`source/`、`audio/`、`video/`、`core/`），架构与本文描述的 v1
 > （`native/csrc/player.c`，`gst-launch-1.0` 子进程 + 两条 FIFO）**完全不同**。

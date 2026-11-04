@@ -167,9 +167,9 @@
  * 必须把落后的一路「推进」到对齐点（真机 T-K=3.843s），按 buffer 个数
  * 限界（8 个 ≈267ms）装不下这段推进量就会永久死锁，所以给到 8s 的余量。
  *
- * 直播（souphttpsrc ! flvdemux）没有这个问题：FLV 是单流实时源，音视频
- * tag 天然交织，demuxer 不做「推进落后一路」这件事。恰恰相反 —— 队列
- * 上限就是**播放延迟的下限**：上限 8s 意味着最坏情况下内存里压着 8 秒
+ * 直播（curl -> FIFO -> filesrc ! flvdemux）没有这个问题：FLV 是单流实时源，
+ * 音视频 tag 天然交织，demuxer 不做「推进落后一路」这件事。恰恰相反 ——
+ * 队列上限就是**播放延迟的下限**：上限 8s 意味着最坏情况下内存里压着 8 秒
  * 视频，画面恒定落后直播边缘最多 8s（用户感知就是「直播比弹幕慢好几秒」），
  * 而且弱网时积压的 8s 数据会在恢复瞬间一次性灌给解码器。
  *
@@ -178,7 +178,7 @@
  *   - 又不至于把延迟堆到不可接受。实测直播 90s 长跑 vid_fps=30.08、
  *     big_gaps=0，与 8s 无差别，但延迟上限从 8s 降到 2s。
  *
- * 万一将来在某些直播源上出现「队列满 → soup 背压 → 卡顿」，把这个值
+ * 万一将来在某些直播源上出现「队列满 → 上游背压 → 卡顿」，把这个值
  * 调大即可 —— 它只是延迟/抗抖动之间的取捨，不涉及正确性。
  */
 /*
@@ -186,7 +186,7 @@
  *
  * 用户反馈直播每 2~5 秒闪一次屏，怀疑是数据包传输不稳定 —— 方向对。
  * 2s 的队列在 B 站直播（GOP 1~2s + CDN 抖动）下余量太薄：一次稍长的
- * 抖动就把队列抽干，souphttpsrc 背压 → 恢复时一批帧集中涌入 → 要么被
+ * 抖动就把队列抽干，上游背压 → 恢复时一批帧集中涌入 → 要么被
  * max-lateness 丢掉（闪黑），要么积压。4s 能吸收两倍抖动，延迟代价
  * 可接受（直播本来就比现场慢）。
  */
@@ -238,8 +238,9 @@
 /*
  * 【P1-4】直播「可恢复断流」的错误码。
  *
- * 直播是长连接：CDN 掐流、WiFi 抖动、B 站边缘节点切换都会让 souphttpsrc
- * 报 bus error，但流本身十几秒后还能连回来。以前这种错误一律走
+ * 直播是长连接：CDN 掐流、WiFi 抖动、B 站边缘节点切换、斗鱼直链
+ * `expire=300` 到期，都会让源端报错或直接 EOF，但流本身十几秒后
+ * 还能连回来（前提是 URL 本身没过期）。以前这种错误一律走
  * take_error() → PB2_E_PIPELINE + PB2_STATE_ERROR，JS 侧一看到 state=error
  * 就判起播失败、停轮询、弹「播放失败」，用户必须退出重进。
  *
@@ -365,29 +366,42 @@ typedef struct {
     int has_audio;          /* 是否真的建了音频分支 */
     int pipeline_alive;
 
-    /* 媒体源（本地直读 / ffmpeg -> FIFO / 直播直连 GStreamer） */
+    /* 媒体源（本地直读 / ffmpeg -> FIFO / 直播 curl -> FIFO） */
     pb2_src_t src;
     int src_ready;
     long long base_ms;      /* 对 JS 报告位置 = base_ms + query_position() */
     /*
-     * 【直播直连】1 = 本次会话走 souphttpsrc ! flvdemux，**没有 ffmpeg、没有 FIFO**。
+     * 【直播】1 = 本次会话是直播，源是 fork 出来的 curl 写 FIFO +
+     * `filesrc ! flvdemux`。
      *
-     * 为什么必须绕开 ffmpeg（真机实测，不可重复验证的结论）：
-     *   B 站直播 FLV 的 PTS 是绝对值（实测 ≈2854014 秒，ffprobe 报
-     *   `start: 2853204.901`、`ClusterTimeCode: 2854183333`）。ffmpeg 转封装
-     *   写 FIFO 后，流式 matroskademux 面对「首 PTS 巨大」的流会永久停在
-     *   PREROLLING（实测 rc=124 超时、buffers=0）；`-copyts` 与否、
-     *   `-f mpegts`+tsdemux、`-re` 慢喂，全部一样卡。而 ffmpeg 先落到**普通
-     *   文件**再 filesrc 读就正常 —— 说明是「FIFO 上的流式 demux 无法处理
-     *   巨大起始 PTS」，不是 URL 或网络问题。
-     *   点播 m4s 的 PTS 从 0 附近开始，所以点播完全正常，这就是分界线。
-     *   实测直连 `souphttpsrc ! flvdemux` 双分支 45 秒 3018 帧 / 69.4fps / 0 drop。
+     * 历史（真机实测，别再走回头路）：
+     *   1) 最初试 `souphttpsrc ! flvdemux` 直连。拉斗鱼 CDN 必定失败，
+     *      错误是 `Server does not accept Range HTTP header` ——
+     *      GstBaseSrc 的 push 模式照样带 Range，is-live / iradio-mode
+     *      各种组合都试过，无效。
+     *   2) 也试过「ffmpeg 转封装写 FIFO」（点播那条路）。B 站直播 FLV 的
+     *      PTS 是绝对值（实测 ≈2854014 秒），流式 matroskademux 面对
+     *      「首 PTS 巨大」的流会永久停在 PREROLLING（实测 rc=124 超时、
+     *      buffers=0）；`-copyts`、`-f mpegts`+tsdemux、`-re` 慢喂全一样卡。
+     *      而 ffmpeg 先落普通文件再 filesrc 读就正常 —— 说明是「FIFO 上的
+     *      流式 demux 无法处理巨大起始 PTS」，且 flvdemux 跟 matroska 是
+     *      两回事，不能直接套用。
+     *   3) 最终方案：设备自带 curl 拉同一条 FLV 直链稳定可用（`curl -s URL
+     *      -o <fifo>` 实测正常），让 curl 写 FIFO、filesrc 读、flvdemux 拆。
+     *      注意 curl 的 **stdout 管道是坏的**（`curl URL | cat` 得 0 字节），
+     *      所以必须 `-o <fifo>` 传参，见 src_http.c 的 spawn_curl。
      *
-     * 带来的语义差异（都已在下面各函数里按 is_live 分支处理）：
-     *   - 没有 pb2_src_open()，src_ready 恒 0，所有「源存活探测 / 自愈重试」自动跳过。
-     *   - base_ms 恒 0；位置改用「本次会话已播时长」，因为 FLV 的绝对 PTS 不能直接报给 JS。
+     * 因此直播现在**有** pb2_src_t（is_live=1、pid=curl、fifo 路径），
+     * src_ready=1，源存活探测和自愈重试对直播同样生效 —— 与上一版
+     * 「src_ready 恒 0」的语义相反，所有 is_live 分支都已按新语义复核过。
+     *
+     * 仍然保留的语义差异（都已在各函数里按 is_live 分支处理）：
+     *   - base_ms 恒 0；位置改用「本次会话已播时长」，因为 FLV 的绝对 PTS
+     *     不能直接报给 JS。
      *   - durationMs 恒 0（JS 侧 isStreamEnded() 对 durationMs<=0 恒返回 false）。
-     *   - seek 无意义，直接忽略。
+     *   - seek 无意义，直接忽略（FIFO 不可 seek）。
+     *   - curl 收 SIGTERM 会先 flush 缓冲，所以回收时必须直接 SIGKILL
+     *     （见 reap_pair_ex 的 hard_kill 参数）。
      */
     int is_live;
 
@@ -570,8 +584,8 @@ static int rotation_for_transpose(int t) {
  * 悄悄停手，`out[o] = 0` 之后调用方完全看不出少了一半。直播 URL 带
  * expires/sign/token 等参数，实测 600~900 字符，jsapi 允许 input 最长
  * 1024；一旦 URL 里出现需要转义的 `"` 或反斜杠（CDN 签名偶尔会有），
- * 长度会膨胀并被切断 —— 症状是 souphttpsrc 拿半截 location 去请求，
- * CDN 回 403/404，用户看到「直播永远转圈」，而日志里只有 soup 的错误，
+ * 长度会膨胀并被切断 —— 症状是请求里拿到半截 URL，CDN 回 403/404，
+ * 用户看到「直播永远转圈」，而日志里只有 CDN 的错误，
  * 完全看不出是 URL 被截断。调用方必须拿到这个信号并 patch_error。
  */
 static int desc_escape(const char *in, char *out, size_t cap) {
@@ -690,19 +704,25 @@ static int build_pipeline(pb2_open_req_t *req, int src_already_open);
 static void apply_bt_avrcp_volume(void);
 
 /*
- * 【直播】重建直播直连管线的唯一入口。
+ * 【直播】重建直播管线的唯一入口。
  *
- * 直播没有 ffmpeg、没有 FIFO、没有「位置」概念，所以所有「需要重建管线」
- * 的场景（蓝牙/耳机路由变更、键盘收起后恢复视频矩形）都不能走 do_seek()
- * ——那条路径会先 pb2_src_open(target_ms) 起 ffmpeg 拉 FLV，直播下必然
- * 卡在流式 demuxer 的永久 PREROLLING（见 pb2_worker_t.is_live 注释）。
+ * 直播没有「位置」概念（FIFO 不可 seek），所以所有「需要重建管线」的场景
+ * （蓝牙/耳机路由变更、键盘收起后恢复视频矩形、RECOVER）都不能走
+ * do_seek() —— 那条路径会先 pb2_src_open(target_ms) 起 ffmpeg，直播下
+ * 完全没有意义（而且本函数的入口处 do_seek 已经对 is_live 早退了）。
  *
  * 这里直接 teardown + build_pipeline(req, 0)，build_pipeline 内部会重新
- * 走 is_live 分支（souphttpsrc ! flvdemux），并带上 g_w.rect / g_w.adev
- * 的当前值，所以「换 device」和「换矩形」都能生效。
+ * 走 is_live 分支（连 pb2_src_open_live 起一条新 curl + 新 FIFO），
+ * 并带上 g_w.rect / g_w.adev 的当前值，所以「换 device」和「换矩形」都能生效。
  *
- * 代价：直播要重新拉一次流（约 0.5~1.5s）。这两类事件都是低频的
- * （插拔耳机、收起键盘），可以接受。
+ * 注意：curl 的 URL 是原来那条（带 expire 签名）。真机实测斗鱼直链是
+ * **一次性**的：同一条 URL 第二次 GET 只回 216KB / 0.93s 就 EOF，再往后
+ * 稳定在 ~424KB / 0.8s 后 EOF（详见 live_schedule_reconnect 的注释）。
+ * 所以这条重建路径只对**首次**拉流有效；重连（第二次起）必然会秒 EOS，
+ * 唯一出路是 JS 重取直链再 open()。
+ *
+ * 代价：直播要重新拉一次流（约 0.5~1.5s）。这几类事件都是低频的
+ * （插拔耳机、收起键盘、看门狗触发），可以接受。
  *
  * 只能在 worker 线程调用（会 set_state(NULL) / 释放 GstElement）。
  */
@@ -788,7 +808,8 @@ static void live_rebuild_pipeline(const char *why) {
          * 用户手动返回重进。
          *
          * 注意直播管线在分支建起来之前没有 sink，set_state 通常直接 SUCCESS；
-         * 但 CDN 有问题时 souphttpsrc 会先失败，这里就靠返回值/Failure 兜住。
+         * 但 CDN 有问题时 curl 拉不到数据、flvdemux 拿不到完整 header，
+         * 这里就靠返回值 / Failure / preroll 超时兜住。
          */
         GstState cur = GST_STATE_NULL;
         GstState pend = GST_STATE_NULL;
@@ -828,6 +849,19 @@ static void live_rebuild_pipeline(const char *why) {
         pb2_probe_reset(&g_w.probe);
         g_w.seek_frames_base = 0;
         g_w.avskew_last_log_ms = 0;
+        /*
+         * 源死亡标记必须一起清：上一轮断流时 check_src_after_first_frame()
+         * 会置 src_died=1 / src_died_at_ms=旧时刻。重建后新 curl 是活的，
+         * 但残留的 src_died 会让 next tick 立刻判「3 秒过去还没 EOS」→
+         * patch_alive(0)，JS 看门狗拿到「源已死」就拆播放页 —— 明明刚
+         * 重连成功。语义上 src_died 描述的是「当前这条 src」，重新 open
+         * 之后就是另一条了，必须清零。
+         */
+        g_w.src_died = 0;
+        g_w.src_died_at_ms = 0;
+        g_w.last_src_check_ms = g_w.frame_epoch_ms;
+        g_w.last_src_check2_ms = g_w.frame_epoch_ms;
+        pb2_stats_patch_alive(&g_w.stats, 1);
         pb2_stats_patch_error(&g_w.stats, PB2_E_NONE, "");
         /*
          * 位置不能在重建后掉回 0：teardown_pipeline() 会 patch_position(0,0)。
@@ -1650,7 +1684,7 @@ rebuild:
          * 【直播】路由变更不能走 seek 路径（直播 seek 恒被忽略，走了也不会
          * 重建，插拔耳机后音频还固定在旧 device 上）。
          * 交给 live_rebuild_pipeline()：teardown 后 build_pipeline(req, 0)
-         * 会重新走 is_live 分支（souphttpsrc ! flvdemux），不需要 ffmpeg。
+         * 会重新走 is_live 分支（重开一条 curl + 新 FIFO + filesrc）。
          * 代价是直播要重新拉一次流（约 0.5~1.5s），但插拔耳机是低频事件，
          * 且这是唯一能让 alsasink 换到新 device= 的办法（PLAYING 下改
          * device 不会重开 PCM）。
@@ -2223,63 +2257,73 @@ static int build_pipeline(pb2_open_req_t *req, int src_already_open) {
      * 这里只建 GStreamer 管线，不再 spawn ffmpeg。
      */
     /*
-     * 【直播直连】souphttpsrc ! flvdemux，完全绕开 ffmpeg + FIFO。
-     * 判据与理由见 pb2_worker_t.is_live 的注释。这里必须**在**
-     * pb2_src_open() 之前分流，否则会先起一个注定卡死的 ffmpeg。
+     * 【直播】curl 写 FIFO + filesrc ! flvdemux。
+     *
+     * 为什么要绕开 souphttpsrc（真机实测，别再改回去）：
+     *   拉斗鱼 CDN 必定失败，错误是 `Server does not accept Range HTTP header`
+     *   —— GstBaseSrc 的 push 模式照样发 Range，is-live / iradio-mode 各种
+     *   组合都试过无效。而设备自带的 curl 拉同一条 FLV 直链稳定可用。
+     *
+     * 为什么也不用 ffmpeg（点播那条路）：直播不需要转容器、不需要 -ss 定位，
+     * 只需要把原始字节灌进 flvdemux。多一层 ffmpeg 只是多一份延迟和一处
+     * 可能自己改时间戳的地方。
+     *
+     * 判据见 pb2_worker_t.is_live 的注释；这里必须**在** pb2_src_open()
+     * 之前分流，否则会先起一个注定卡死的 ffmpeg。
      */
     g_w.is_live = is_live_request(req);
     if (g_w.is_live) {
+        g_w.base_ms = 0; /* 直播不可 seek，位置由 live_position_ms() 自己算 */
         /*
-         * g_w.src 清零：直播没有 pb2_src_t 语义（无 ffmpeg、无 FIFO），
-         * 但结构体可能残留上一次点播会话的 is_http/baseMs/pid 等字段。
-         * 虽然直播路径上所有消费点都已用 is_live 或 src_ready 挡掉，
-         * 清零是防止将来新增代码误读（尤其 pb2_src_alive/reap_if_dead
-         * 这类按 pid 判活的函数）。
+         * 防御：正常情况下调用方已经 teardown 过（src_ready=0），但如果
+         * 有人在 src_ready=1 时调进来，必须先彻底回收旧 curl + FIFO，
+         * 否则每切一次台就漏一个进程和一条管道。
+         *
+         * **必须**只在 !src_already_open 时做：src_already_open=1 表示
+         * 调用方（自愈重试 / seek 并行下载）刚刚把 g_w.src 建好并置了
+         * src_ready=1，这里若照样 close 掉，等于把刚起好的 curl 杀了
+         * 却又不再重开，管线接一条死 FIFO，现象是「永远没帧」。
          */
-        memset(&g_w.src, 0, sizeof(g_w.src));
-        g_w.src.hold_fd = -1;
-        g_w.src.hold_fd2 = -1;
-        g_w.base_ms = 0;
-        g_w.src_ready = 0;
+        if (!src_already_open && g_w.src_ready) {
+            pb2_src_close(&g_w.src);
+            g_w.src_ready = 0;
+        }
+        if (!src_already_open) {
+            if (pb2_src_open_live(&g_w.src, req->input, req->userAgent, req->referer) != 0) {
+                pb2_stats_patch_error(&g_w.stats, PB2_E_OPEN_FAILED,
+                                      "live source open failed (curl spawn)");
+                return -1;
+            }
+        }
+        g_w.src_ready = 1;
         /*
-         * 【P1-5】直播 URL 实测 600~900 字符，loc1 只有 1200。
-         * 一旦 URL 里有需要转义的字符（`"` 或反斜杠）导致膨胀越界，
-         * 以前会静默截断，souphttpsrc 拿半截 location 去请求 → CDN 403，
-         * 用户看到「直播永远转圈」，日志里只有 soup 的错误，看不出根因。
-         * 现在明确判失败：打一条能一眼定位的日志 + patch_error，
-         * 直接返回 -1 让 do_open/recover 走统一的失败路径。
+         * FIFO 路径是 /tmp/pb2/dy-<pid>-<seq>.fifo，远不到 loc1 的容量，
+         * 但也一并判一下：真截断了 filesrc 会打开失败，日志里只有
+         * 「no such file」，看不出根因。
          */
-        if (desc_escape(req->input, loc1, sizeof(loc1)) != 0) {
-            pb2_logf("live: URL TOO LONG for desc buffer (input=%u bytes, cap=%u) "
-                     "-> escaped location truncated, refusing to start",
-                     (unsigned)strlen(req->input), (unsigned)sizeof(loc1));
+        if (desc_escape(g_w.src.location, loc1, sizeof(loc1)) != 0) {
+            pb2_logf("live: FIFO path too long for desc buffer (fifo=%s cap=%u)", g_w.src.fifo,
+                     (unsigned)sizeof(loc1));
             pb2_stats_patch_error(&g_w.stats, PB2_E_OPEN_FAILED,
-                                  "live url too long (escaped location truncated)");
+                                  "live fifo path too long for desc");
+            pb2_src_close(&g_w.src);
+            g_w.src_ready = 0;
             return -1;
         }
         loc2[0] = '\0';
-        pb2_logf("live: direct gst path (durationMs=%d, url ends .flv=%d)",
-                 (int)req->durationMs, url_ends_flv(req->input));
+        pb2_logf("live: curl->fifo path (durationMs=0, url ends .flv=%d, ua=%s, ref=%s)",
+                 url_ends_flv(req->input), (req->userAgent && req->userAgent[0]) ? "given" : "default",
+                 (req->referer && req->referer[0]) ? "given" : "none");
         /*
-         * desc 里只写 location。
+         * UA / Referer 不再需要在这里补设 —— 它们已经在 spawn_curl 的 argv 里
+         * （`-A` / `-e`），比 souphttpsrc 的 `extra-headers` GstStructure 属性
+         * 直接得多。这也是这版改动顺带解决的一个坑。
          *
-         * 为什么 `user-agent` / `extra-headers` 不写进 desc：
-         *   - `extra-headers` 的属性类型是 **GstStructure**
-         *     （`gst-inspect-1.0 souphttpsrc` 报 `Boxed pointer of type
-         *     "GstStructure"`），不是 string。写 `(string)"..."` 会被
-         *     gst_util_set_object_arg 拒绝并静默不生效；写裸
-         *     `extra-headers,Referer=...` 又会在 desc 词法层和后面的
-         *     `! flvdemux` 撞在一起（逗号/空格语义不同），很容易解析成
-         *     别的属性。
-         *   - 所以这里 desc 只留 location（唯一需要转义的字符串），
-         *     UA 与 Referer 在 parse 成功后用 gst_util_set_object_arg
-         *     直接设到 souphttpsrc 元素上（见下面 live 分支的收尾）。
-         *   - 结构体名必须打头：`extra-headers,Referer=<url>`。只写
-         *     `Referer=<url>` 会被当成「无字段名的单值」，静默不生效，
-         *     而 B 站直播 CDN 不带 Referer 直接 403（早前实测过）。
+         * blocksize=65536 必须在：FIFO 上 filesrc 默认短读会破坏 FLV 流
+         * （与点播 FIFO 同一个实测结论）。
          */
         n = snprintf(desc, sizeof(desc),
-                     "souphttpsrc name=src location=\"%s\" ! flvdemux name=vd", loc1);
+                     "filesrc location=\"%s\" blocksize=65536 ! flvdemux name=vd", loc1);
         off = (size_t)(n > 0 ? n : 0);
         goto parse_it;
     }
@@ -2372,49 +2416,18 @@ parse_it:
     }
 
     /*
-     * 【直播直连】souphttpsrc 的 UA / Referer 在这里补设。
+     * 【直播】UA / Referer 不在这里补设了。
      *
-     * 为什么不写在 desc 里（重要，改之前先看这段）：
-     *   - `extra-headers` 的属性类型是 **GstStructure**
-     *     （`gst-inspect-1.0 souphttpsrc` 报 `Boxed pointer of type
-     *     "GstStructure"`），不是 string，desc 里无论写
-     *     `(string)"..."` 还是裸 `extra-headers,Referer=...` 都会在
-     *     gst_parse_launch 的词法层被切碎（逗号是属性分隔符，而结构体
-     *     名本身要打头），实测两条写法都设不进去。
-     *   - `gst_util_set_object_arg` 用的是 GstStructure 文本语法，
-     *     对 boxed 属性走的就是「结构体名打头」的形式，所以
-     *     `extra-headers,Referer=<url>` 这一种写法才是对的 —— 只写
-     *     `Referer=<url>` 会被当成「无字段名的单值」，静默不生效，
-     *     而 B 站直播 CDN 不带 Referer 直接 403（早前实测过）。
-     * 注意这是 parse 之后、set_state 之前，souphttpsrc 还没开始请求。
+     * 上一版直播是 `souphttpsrc name=src`，必须 parse 之后拿 "src" 元素用
+     * gst_util_set_object_arg 设 `user-agent` 和 `extra-headers`
+     * （`extra-headers` 是 GstStructure 类型，desc 里写不进去）。
+     * 现在直播源是 fork 出来的 curl 进程，UA / Referer 直接就是 argv 里的
+     * `-A` / `-e`（见 src_http.c 的 spawn_curl），比 GstStructure 文本语法
+     * 直接，也不存在「设不进去还静默成功」的坑。
+     *
+     * 所以这里不再 get_by_name("src") —— pipeline 里根本没有这个元素了，
+     * 留着只会每次开播打一条 `element 'src' not found` 的 WARNING。
      */
-    if (g_w.is_live) {
-        GstElement *src_el = gst_bin_get_by_name((GstBin *)g_w.pipe, "src");
-        if (src_el) {
-            char hv[768];
-            const char *ua = (req->userAgent && req->userAgent[0])
-                                 ? req->userAgent
-                                 : "Mozilla/5.0 (Linux; Android 9) player2";
-            const char *rf = (req->referer && req->referer[0]) ? req->referer
-                                                              : "https://www.bilibili.com";
-            gst_util_set_object_arg(src_el, "user-agent", ua);
-            snprintf(hv, sizeof(hv), "extra-headers,Referer=%s", rf);
-            gst_util_set_object_arg(src_el, "extra-headers", hv);
-            pb2_logf("live: souphttpsrc ua=\"%.40s...\" extra-headers=%.120s", ua, hv);
-            /*
-             * timeout / retries 显式写死，不依赖默认值。
-             * 设备实测的默认值恰好就是 timeout=15（秒，0=不超时）、
-             * retries=3，所以这里写的是同一组值 —— 目的是把「直播要的
-             * 是长连接而不是点播式重试」这件事钉在代码里：以后若有人调
-             * souphttpsrc 的默认值，直播这条路径不会跟着变。
-             */
-            gst_util_set_object_arg(src_el, "timeout", "15");
-            gst_util_set_object_arg(src_el, "retries", "3");
-            gst_object_unref(src_el);
-        } else {
-            pb2_logf("live: WARNING souphttpsrc element 'src' not found in pipeline");
-        }
-    }
 
     /*
      * 裸流（.h264/.h265）：desc 里是固定分支，没有 demuxer、也不会触发 pad-added。
@@ -2824,7 +2837,7 @@ static void do_open(pb2_open_req_t *req) {
                          "(v=%d a=%d) -> treat as playing",
                          sr, cur, pend, g_w.vbranch ? 1 : 0, g_w.abranch ? 1 : 0);
             } else {
-                pb2_logf("OPEN failed: preroll %s (sr=%d cur=%d pend=%d v=%d/%d a=%d/%d) -> error",
+                pb2_logf("OPEN failed: preroll %s (sr=%d cur=%d pend=%d v=%d/%lld a=%d/%d) -> error",
                          sr == GST_STATE_CHANGE_ASYNC ? "timeout" : "failure", sr,
                          cur, pend,
                          g_w.vbranch ? 1 : 0,
@@ -3261,10 +3274,31 @@ static void do_seek(long long target_ms) {
 /*
  * 【P1-4】直播断流 → 自动重连。
  *
- * 触发源有两个：
- *   1. bus 上来 ERROR（souphttpsrc 的 I/O 错误、flvdemux 解析失败）；
- *   2. 连续 PB2_LIVE_STALL_MS 没有视频帧（CDN 不再推数据，soup 也不报错，
- *      表现为「画面定住但管线还活着」—— 这是直播最常见的一种断流）。
+ * 触发源有三个：
+ *   1. bus 上来 ERROR（curl 侧已由 --speed-time 兜住，但 flvdemux 解析
+ *      失败、filesrc 读 FIFO 出错仍会走这里）；
+ *   2. 连续 PB2_LIVE_STALL_MS 没有视频帧（CDN 不再推数据，curl 也不报错，
+ *      表现为「画面定住但管线还活着」—— 这是直播最常见的一种断流）；
+ *   3. bus EOS —— 直播的 EOS 只代表「这一轮 curl 走完了」。斗鱼的直播
+ *      直链带 `expire=300`，5 分钟必然到期，所以 EOS 对直播是**常态**，
+ *      更不能当成「播完」。见 handle_bus_message 里的直播 EOS 分支。
+ *
+ * 注意重连用的是「原 URL 原样重开」，而**斗鱼直链是一次性的**（真机实测，
+ * 2026-11-04，X6 Pro）：
+ *   - 全新未用过的 URL：curl 能连续拉满（20s 测出 1.34MB，未断）；
+ *   - 同一条 URL 第二次 GET：只给 216KB / 0.93s 就 EOF；
+ *   - 再往后：稳定在 ~424KB / 0.8s 后 EOF（与早期实测的 427KB 吻合 ——
+ *     当时看到的「427KB 就断」其实就是这个复用行为，不是 CDN 掐流）。
+ * 也就是说：**重连一旦复用原 URL，必然立刻 EOS**，会打满
+ * PB2_LIVE_RECONNECT_MAX 次然后认输。这不是 native 能修的，只能靠 JS
+ * 重新调 getH5PlayV1 取新直链再 open()。
+ *
+ * native 这边的职责是：把「该换 URL 了」这件事**尽快、明确**地报出去。
+ * 所以重连失败不报 ERROR（会把 UI 打成播放失败），而是持续刷
+ * PB2_E_LIVE_RECONNECT(=17) 且保持 state=PLAYING，配额耗尽后才报
+ * PB2_E_PIPELINE(=6) + PB2_STATE_ERROR。JS 侧推荐的做法：**一看到 17
+ * 就去取新直链**（不必等配额耗尽），native 会在新 open() 里把
+ * live_reconnect_count 清零（见 do_open / reset_session_fields）。
  *
  * 与 js2 约定的语义（务必别改）：
  *   - patch_error(PB2_E_LIVE_RECONNECT) 时 **绝不改 state**，保持 PLAYING。
@@ -3444,6 +3478,21 @@ static void handle_bus_message(GstMessage *msg) {
 
     nm = msg_name(msg);
     if (strcmp(nm, "eos") == 0) {
+        /*
+         * 【直播 EOS ≠ 播完】直播源是 curl 拉 FLV 直链，斗鱼那种 URL 带
+         * `expire=300`（5 分钟），curl 到点就自然收尾 → FIFO EOF →
+         * flvdemux 发 EOS。这不是「这场直播结束了」，只是「这一轮连接
+         * 到期了」，必须接着重连，否则用户看 5 分钟就永久停住。
+         *
+         * 所以直播这条**不能**走下面的 eos=1 + STOPPED：一旦置了 eos，
+         * check_live_reconnect 的 `if (g_w.eos) return;` 会把重连永久
+         * 挡死（UI 显示已停止，但直播其实还在）。
+         */
+        if (g_w.is_live) {
+            pb2_logf("BUS EOS (live) -> treat as expired connection, reconnect");
+            live_schedule_reconnect("stream eos");
+            return;
+        }
         pb2_logf("BUS EOS");
         g_w.eos = 1;
         pb2_stats_patch_state(&g_w.stats, PB2_STATE_STOPPED);
@@ -3797,14 +3846,28 @@ static void check_first_frame(void) {
             if (g_w.first_frame_retries < 2 && g_w.req &&
                 now - g_w.frame_epoch_ms + 2000 <= PB2_FIRST_FRAME_TIMEOUT_MS) {
                 long long t_restart = pb2_now_ms();
+                int reopen_ok;
                 pb2_logf("first frame: src died before any frame (+%lldms) -> retry %d",
                          now - g_w.frame_epoch_ms, g_w.first_frame_retries + 1);
                 teardown_pipeline();
                 pb2_src_close(&g_w.src); /* 关掉死源的 FIFO/句柄，日志见 reap */
                 g_w.src_ready = 0;
-                if (pb2_src_open(&g_w.src, g_w.req->input, g_w.req->input2,
-                                 g_w.req->userAgent, g_w.req->referer, g_w.base_ms,
-                                 g_w.req->durationMs) == 0) {
+                /*
+                 * 直播重开必须走 curl 分支。原来这里只有 pb2_src_open()，
+                 * 而直播改成 curl->FIFO 之后，那样重开等于起一个 ffmpeg
+                 * 把 matroska 写进 FIFO，再让 flvdemux 去读 —— 必然失败，
+                 * 而且失败得很难看出来（日志里只是「没有帧」）。
+                 */
+                if (g_w.is_live) {
+                    reopen_ok = pb2_src_open_live(&g_w.src, g_w.req->input,
+                                                  g_w.req->userAgent,
+                                                  g_w.req->referer) == 0;
+                } else {
+                    reopen_ok = pb2_src_open(&g_w.src, g_w.req->input, g_w.req->input2,
+                                             g_w.req->userAgent, g_w.req->referer, g_w.base_ms,
+                                             g_w.req->durationMs) == 0;
+                }
+                if (reopen_ok) {
                     g_w.src_ready = 1;
                     if (build_pipeline(g_w.req, 1) == 0) {
                         gst_element_set_state(g_w.pipe, GST_STATE_PLAYING);
@@ -3895,16 +3958,17 @@ static void check_first_frame(void) {
 /*
  * 【P1-1】首帧之后的「源已死」探测。
  *
- * 背景：ffmpeg 是独立子进程，`-c copy` 到 FIFO。它中途退掉（网络断、URL
- * 过期、CDN 掐流）时，FIFO 的写端没了，但我们**自己还持着 O_RDWR 的
+ * 背景：源是独立子进程（点播 = ffmpeg `-c copy`，直播 = curl `-o`），
+ * 都往 FIFO 里写。它中途退掉（网络断、URL 过期、CDN 掐流、
+ * `--speed-time` 超时）时，FIFO 的写端没了，但我们**自己还持着 O_RDWR 的
  * hold_fd**，所以 filesrc 永远等不到 EOF → 既不出帧也不发 EOS → 界面上
  * 就是「画面冻住、进度条不动、也不报错」。
  *
  * 这里做两件事：
  *   1. 按 worker 空闲 tick 的 PB2_SRC_CHECK_MS（1000ms）节奏探一次
  *      `pb2_src_reap_if_dead()`。它确认写端真死之后才 close(hold_fd)，于是
- *      filesrc 立刻 EOF、matroskademux 发 EOS，走 handle_bus_message() 的
- *      eos 分支正常收尾。
+ *      filesrc 立刻 EOF、demuxer（matroskademux / flvdemux）发 EOS，
+ *      走 handle_bus_message() 的 eos 分支正常收尾。
  *   2. 只打标记置 src_died，**不立刻 patch_alive(0)**（理由见结构体注释）。
  *      若 3 秒内 EOS 没来（demuxer 可能卡在半个 cluster 上），才补一个
  *      patch_alive(0) 让 JS 的看门狗能接手。
@@ -3918,14 +3982,17 @@ static void check_src_after_first_frame(void) {
     if (!g_w.pipeline_alive) return;
     if (g_w.eos) return;
     /*
-     * 【直播】这条探测整条对直播无意义：直播没有 ffmpeg 子进程，
-     * src_ready 恒 0（下面 `if (!g_w.src_ready) return;` 其实也会挡住），
-     * 但直播的「流断了」是靠现有 bus ERROR/EOS 分支收尾的，不需要
-     * 也不应该走 ffmpeg 存活探测。这里显式早退，免得以后有人给直播
-     * 也填上 src_ready 就误触发。
+     * 【直播】这条探测现在对直播同样有效 —— 直播源是 curl 进程写 FIFO，
+     * curl 一旦退出（CDN 掐流、`expire=300` 到期、--speed-time 超时），
+     * 这里的 reap_if_dead 会 close(hold_fd)，filesrc 立刻 EOF、
+     * flvdemux 发 EOS，再由 bus EOS 分支去排重连。
+     *
+     * 上一版这里有一句 `if (g_w.is_live) return;`，注释写的是「直播没有
+     * ffmpeg 子进程」—— 那是 souphttpsrc 直连时期的事实，现在不成立了。
+     * 留着它会让 curl 死后没人收尸：FIFO 的 hold_fd 一直开着，filesrc
+     * 永远等不到 EOF，直播就卡成一帧不动，只能等 live_reconnect 的
+     * 6 秒无帧看门狗兜底（慢，而且那 6 秒里 UI 是冻住的）。
      */
-    if (g_w.is_live) return;
-
     now = pb2_now_ms();
 
     /* 已经判定过源死了：只等 EOS，超时才升级成 alive=0 */
@@ -4120,7 +4187,7 @@ static void process_cmd(pb2_cmd_t *c) {
             /*
              * 【P0-1】真正的自愈入口。
              *
-             * 直播：重拉 souphttpsrc（唯一能救活断流的动作）。
+             * 直播：重建管线 + 重开 curl（唯一能救活断流的动作）。
              * 点播：以当前位置投递一次原地 seek，与旧 JS 侧
              *       seekBy(currentPos) 等价，但省掉一次 JS→native 往返。
              *
@@ -4130,7 +4197,7 @@ static void process_cmd(pb2_cmd_t *c) {
             if (!g_w.req) {
                 pb2_logf("RECOVER ignored: no session");
             } else if (g_w.is_live) {
-                pb2_logf("RECOVER live: rebuild souphttpsrc (pos=%lldms)",
+                pb2_logf("RECOVER live: rebuild pipeline + respawn curl (pos=%lldms)",
                          live_position_ms());
                 live_rebuild_pipeline("recover");
             } else if (!g_w.pipe || !g_w.pipeline_alive) {

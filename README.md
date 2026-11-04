@@ -1,21 +1,30 @@
-# PenBili
+# PenDouyu
 
-把哔哩哔哩装进有道词典笔。
+把斗鱼直播装进有道词典笔。
 
-这是一款跑在有道词典笔上的 B 站客户端，用有道自家的 Falcon 小程序框架（QuickJS + Vue 2 单文件组件）写成。屏幕只有 960×266 点，指甲盖大小，所以我按 iPad 版 B 站的骨架重做了界面，把推荐、搜索、播放、评论、图文、直播全塞进这一个页面里。
+这是一款跑在有道词典笔上的直播客户端：斗鱼为主（推荐流 / 分类 / 搜索 / 多码率切换），B 站完整保留（推荐、热门、搜索、DASH 点播、评论、图文、扫码登录）。用有道自家的 Falcon 小程序框架（QuickJS + Vue 2 单文件组件）写成，屏幕只有 960×266 点，指甲盖大小。
 
-当前版本 `3.5.4`，只支持 **X6 Pro**（RK3562）。X5 分支已停止维护。
+当前版本 `1.0.0`，只支持 **X6 Pro**（RK3562 / aarch64）。
 
-![version](https://img.shields.io/badge/version-3.5.4-blue)
+![version](https://img.shields.io/badge/version-1.0.0-orange)
 ![license](https://img.shields.io/badge/license-GPL--3.0-green)
 
 ---
 
 ## 为什么值得做
 
-词典笔是个奇怪的目标设备：4 核 A35、1GB 内存、一块 480×960 的竖屏（系统把它旋转 270° 当横屏用）、没有触摸屏只有一块手写板、跑着裁剪过的 Linux 和一套私有小程序运行时。
+这个项目从 [PenBili](https://github.com/56dz/PenBili) fork 出来。B 站那套点播链路（DASH 分离流 → ffmpeg → FIFO → Matroska → MPP 硬解）在 PenBili 里已经跑通，所以一开始我以为「把 URL 换成斗鱼的就完事了」。
 
-它能播 B 站，但难点不在"能不能播"，而在**播放质量**。B 站点播是 DASH 分离流（视频 m4s + 音频 m4s），设备上现成的播放器方案要么软解跑不动 720p，要么 seek 一次卡十几秒。所以我把整条播放链路重写了一遍——这才是这个项目的主要工作量。
+结果斗鱼直播比 B 站点播难得多，因为**它不是 seek 的问题，是拉流的问题**：
+
+- 斗鱼直播是单条 FLV（音视频交织），不需要拼两路 DASH，理论上更简单；
+- 但斗鱼 CDN **不返回 `Content-Length`、不带 `Accept-Ranges`**，设备上的 `souphttpsrc` 在 seekable 判定处直接硬失败：`Server does not support seeking. Server does not accept Range HTTP header`，随后永久停在 PREROLLING；
+- 改成 `is-live=true` / `iradio-mode=true` 换来的不是能播，而是 `403 Forbidden`；
+- 设备上的 `ffmpeg` **任何命令都会挂死**（`rc=124`、日志 0 行、产物不存在），连 `-f lavfi -i testsrc` 这种纯本地源都跑不起来 —— 所以 PenBili 那条「ffmpeg 转封装」的路子在直播上完全走不通。
+
+最后逼出来的方案是 **native 侧 fork 一个 `curl` 子进程，把字节写进命名管道，GStreamer 用 `filesrc` 读这条管道**。中间还发现这个固件上 **`curl` 的 stdout 管道是坏的**（`curl URL | cat` 得 0 字节，而 `curl URL -o file` 正常），所以必须 `-o <fifo>`，不能靠 shell 重定向，也不能 `fdsrc fd=0`。
+
+这些结论没有一条是看文档能想到的，全是真机上一条一条撞出来的。
 
 ---
 
@@ -23,152 +32,147 @@
 
 全部为 X6 Pro 真机采集，960×266。
 
-**推荐流**
+**斗鱼推荐流** —— 左栏顶部是「斗鱼 / B站」站点切换，下面是一级分类
 
 ![推荐流](docs/screenshots/x6-home.png)
 
-**热门**
+**斗鱼二级分类** —— 顶部横排 chip：英雄联盟 / 热门游戏 / 三角洲行动 / DOTA2 / CS2 / 魔兽世界 / 炉石传说 / DNF / 无畏契约 …
 
-![热门](docs/screenshots/x6-hot.png)
+![二级分类](docs/screenshots/x6-cate.png)
 
-**搜索（视频 / 图文 / 直播三栏）**
+**斗鱼搜索** —— 顶部一条 26px 紧凑搜索行，搜「lol」后按标题过滤出正在播的房间，底部「返回分类浏览」
 
 ![搜索](docs/screenshots/x6-search.png)
 
-**播放页** —— 左列信息与互动、中列视频、右列评论
+**斗鱼播放页** —— 左列房间信息 + 四档码率，中列硬件平面直出画面
 
 ![播放页](docs/screenshots/x6-play.png)
 
-**图文详情**
+**B 站** —— 逻辑完全保留，切过去就是 PenBili
 
-![图文详情](docs/screenshots/x6-article.png)
+![B站](docs/screenshots/x6-bili.png)
 
-**我的**
-
-![我的](docs/screenshots/x6-mine.png)
-
-> 除播放页外，其余都是 `miniapp_cli capture` 原样抓的 Falcon 画布层。视频走 DRM/KMS
-> 硬件平面直出，不在画布里，所以画布截图里视频区是黑的——不是 bug。播放页那张为了
-> 展示真实效果，用 `kmssrc` 单独抓了平面帧，按平面几何（`/sys/kernel/debug/dri/0/summary`
-> 里的 `Esmart1-win0` dst）贴回画布。抓帧必须在暂停后做，否则拿到的是解码器正在写的
-> 缓冲区，全是撕裂条。
+> 除播放页外，其余截图都是 `miniapp_cli capture` 原样抓的 Falcon 画布层。视频走 DRM/KMS
+> 硬件平面直出，不在画布里，所以画布截图里视频区是黑的——不是 bug。播放页那张是用
+> `kmssrc` 单独抓了硬件平面帧，再按 `/sys/kernel/debug/dri/0/summary` 里 `Esmart1-win0`
+> 的 dst 矩形逆变换贴回画布的（工具见 `tools/compose_shot.py`）。
+>
+> 抓截图前必须先 `hal-screen on && hal-screen set 60`。背光没开时抓出来是一张 2295 字节的
+> 纯白图，很容易误判成「渲染失败」。
 
 ---
 
 ## 功能
 
+### 斗鱼（`site=douyu`，默认首页）
+
 **浏览**
 
-- 推荐流、热门、搜索、我的四个 tab，卡片网格 5 列，加载更多按整行裁剪不留半行
-- 搜索分「视频 / 图文 / 直播」三栏，各自独立缓存、独立页码，来回切换零请求
+- 一级分类 5 组 + 推荐：网游竞技 / 单机热游 / 手游休闲 / 娱乐 / 正能量，来自 `getLeftNav`
+- 二级分类横排 chip（最多 18 个），选中后拉该分区房间，5 列网格、按整行裁剪不留半行
+- 卡片：封面 166×93 + 下方一条 12px「直播中」橙标 + 热度 + 标题 + 主播
 
 **播放**
 
-- DASH 分离流按 qn 阶梯取最高可用档（`116`=1080P60 → `80`=1080P → `74`=720P60 → `32`=480P → `16`=360P），同档优先 AVC
-- 点视频区暂停/继续；进度条拖动定位（拖动过程中零请求，松手后 250ms 才下发一次）
-- 画质七档：「我的 → 视频调节」，`auto` / `1080p60` / `1080p30` / `720p60` / `720p30` / `480p30` / `360p30`
-- 播放历史（最近 10 条，在「我的」页）
+- 签名取 FLV 直链 → native fork `curl` 拉流 → `flvdemux` → MPP 硬解 → KMS 平面直出
+- 四档码率：原画 `0` / 蓝光4M `4` / 超清 `3` / 高清 `2`，默认 `2`（弱网最稳）
+- 高亮跟的是**服务端实际返回的 rate**，不是请求值 —— 斗鱼会就近取档，拿请求参数当结果会骗人
+- 直链 `expire=300`，页面轮询在拿到后 **210 秒**主动换链（重新签名；改 URL 后缀会 403）
+- 断流自愈：native 连续 6 秒无帧或收到 EOS → 重建管线重连（最多 5 次，退避 2/4/6/8 秒），配额用完上报错误码 `17` 给 JS 触发换链
+- 直播无 seek，进度条位置改显示「已播时长」
 
-**互动**
+**搜索**
 
-- 点赞、投币（2 币，可同时点赞）、收藏（可挑收藏夹）
-- 评论区：主楼 10 条/页、子楼 20 条/页，点主楼展开；系统输入法发评论
-- 发评论时视频平面会自动隐藏，避免盖住键盘
+- 顶部一条 26px 紧凑搜索行，点关键词区拉起系统输入法，右侧按钮浏览态是「搜索」、搜索态是「返回」
+- `getSearchRec` 把关键词映射到分类 → 拉该分类房间 → 本地按标题/主播名过滤
+- `searchShow` 接口有 IP 级风控（`error=1/8`），不可用，所以只能走上面这条兜底链路
+- 搜索结果没有翻页（一次拉 120 条后按整行裁剪），底部右侧老实显示「没有更多了」而不是放个假按钮
+- 搜索态下二级分类 chip 自动隐藏，左栏一级分类仍可见；点它会先退出搜索再切分类
 
-**直播**
+### B 站（`site=bili`）
 
-- 直连 B 站 `http_stream/flv/avc` 直链本地解码，不经过任何自建转码服务器
-- 四档画质，下播检测、断流自动重连（退避 0/2/4/6/8 秒，最多 5 次）
-- 直播态自动隐藏评论区、互动按钮和进度条，视频区撑满
-
-**图文**
-
-- 专栏详情按 `opus` 富文本段 → `content.ops` → `content` HTML 三级回退渲染
-- 图片等比缩放，评论走 `type=12`
-
-**登录**
-
-- B 站 TV 协议扫码，二维码纯 CSS 渲染（零 inline style）
-- 登录态持久化，过期前 60 秒判定失效
+- 推荐流 / 热门 / 搜索（视频·图文·直播三栏）/ 我的，行为与 PenBili 完全一致
+- DASH 点播、画质七档、播放历史（最近 10 条）、点赞投币收藏、评论区、图文详情
+- TV 协议扫码登录，二维码纯 CSS 渲染（零 inline style）
 
 ---
 
 ## 技术实现
 
-### 播放子系统：为什么不能用现成方案
+### 拉流：为什么最后是 curl + 命名管道
 
-设备自带 GStreamer 1.22 和 Rockchip MPP 硬解，看起来直接用 `playbin` 就完事了。实际试下来每条路都堵死：
-
-| 方案 | 结果 |
+| 方案 | 真机结果 |
 | --- | --- |
-| `souphttpsrc` 直连 HTTP 播放 | **永远无法 seek**。souphttpsrc 只实现 push 模式的 `create()`、不实现 `pull_range`，qtdemux 在 push 模式下直接丢弃 seek 事件。它报的 `seekable: 1` 是骗人的，只看 `Accept-Ranges` 头 |
-| ffmpeg 软解 + 逐帧贴 fb0 | 720p 只有 0.76x 实时，必卡 |
-| ffmpeg 下载到本地 MP4 再播 | 增长中的 MP4 用 `filesrc` 读会永久卡死——`filesrc` 在打开时就把文件长度快照下来了 |
-| ffmpeg 转 MPEG-TS 边下边播 | 双分支 preroll 永久卡死，且 ffmpeg 输出的时间戳错乱 |
-| ffmpeg 转 fragmented MP4 边下边播 | 视频帧间隔严重超标（`<20ms` 区间 169 帧） |
-
-最终方案是 **ffmpeg → 命名管道 → GStreamer**：
+| `souphttpsrc ! flvdemux` | `Server does not accept Range HTTP header`，PREROLLING 永久卡死。斗鱼 CDN 返回 200 但没有 `Content-Length` / `Accept-Ranges` |
+| `souphttpsrc is-live=true iradio-mode=true` | 有时仍是同样的 Range 错，有时 `403 Forbidden` |
+| `ffmpeg -i <url> -c copy -f flv fifo` | 设备上的 ffmpeg **所有命令都挂死**（`rc=124`、日志 0 行），连 `-f lavfi -i testsrc` 本地源都不行 |
+| `curl URL \| gst fdsrc fd=0` | `Got EOS before any data`，每次 0 字节 |
+| **`curl -o <fifo>` + `filesrc location=<fifo>`** | ✅ 首帧 `+737ms`，18.7 秒无 EOS |
 
 ```
-ffmpeg (-ss T, -c copy, -copyts, -f matroska) ──→ FIFO ──→ filesrc
-                                                              │
-                                    ┌─────────────────────────┴──────────────────┐
-                                    │ matroskademux                              │
-                                    ├── video: queue → h264parse → mppvideodec ──┤
-                                    │          → videorate → kmssink(plane 76)   │
-                                    └── audio: queue → aacparse → faad ──────────┤
-                                               → audioresample → alsasink       │
+curl -s -L -o <fifo>  ──→  /tmp/pb2/dy-<pid>-<seq>.fifo  ──→  filesrc blocksize=65536
+                                                                      │
+                                                    ┌─────────────────┴──────────────────┐
+                                                    │ flvdemux                           │
+                                                    ├── video: queue → h264parse ────────┤
+                                                    │     → mppvideodec               │
+                                                    │     → videorate → kmssink(76)   │
+                                                    └── audio: queue → aacparse ─────────┤
+                                                          → faad → resample → alsasink  │
 ```
 
-几个关键决策，每一条都是实测撞出来的：
+几个关键细节，每一条都是实测撞出来的：
 
-**容器必须是 Matroska。** 只有它逐簇写入、头部写完就能解码、不需要回填索引。MP4 的 moov 在尾部，TS 和 fMP4 各有各的坑。这个结论花了整整一轮实验才确认。
+**这个固件上 curl 的 stdout 管道是坏的。** `curl -s URL | cat > f` 得 0 字节，`curl -s URL | wc -c` 得 0，`curl -v | cat` 直接报 `curl: (3) Error`；但 `curl -s URL > f`（413724 字节）和 `curl -s URL -o f`（427497 字节）都正常。`/bin/curl` 是真正的 ELF 二进制（157632 字节，aarch64，stripped），不是脚本，所以这个行为改不了，只能绕开。`spawn_curl()` 因此用 `posix_spawn` + `-o <fifo>`，同时把 `STDOUT_FILENO` 也 `addopen` 到同一条 FIFO 当双保险。
 
-**单 FIFO + 单 demuxer，不是双 FIFO + 双 demuxer。** 早期版本让音视频各走一个 FIFO、各配一个 demuxer，结果 seek 后音频稳定领先视频 1~2 秒。根因是两个 demuxer 各自把 `segment.start` 定成"自己第一条流的 PTS"——视频从关键帧 K 开始（K ≤ T），音频精确从 T 开始，两条分支都在自己的 base_time 起播，于是内容 K 和内容 T 同时播，差 T−K（B 站关键帧间隔 1~2 秒）。改成单 demuxer 后只有一个 segment（start = 全局最小 PTS = K），内容 c 在两路的 PTS 都是 c、running_time 都是 c−K，天然对齐。
+**FIFO 的打开顺序决定成败。** 先 `hold_fd = open(fifo, O_RDWR | O_CLOEXEC | O_NONBLOCK)`，再 spawn 写端。Linux 允许用 `O_RDWR` 打开 FIFO 且永不阻塞，于是「写端等读端、读端等写端」的死锁不可能发生，`curl` 和 `filesrc` 都能立刻打开。代价是自己也算一个读端：写端全部消失后 `filesrc` 收不到 EOF，所以必须由 `pb2_src_reap_if_dead()` 确认写端进程真死后**主动 close(hold_fd)**。
 
-**`-copyts` 是 A/V 对齐的必要条件，但它和 `-t` 是致死组合。** `-copyts` 保留原始 PTS，这正是不对齐能修复的原因。但 ffmpeg 4.4.1 在 `-copyts` 下 `-t` 是按**原始时间轴**截断的——我原来的公式 `durationMs − baseMs + 5s` 在 base 较大时会算出小于原始 PTS 的值，于是所有包都被过滤掉，ffmpeg 返回码 0、输出 0 个包、stderr 全空。这个 bug 表现为"第三次 seek 必然起不来"，查了很久才发现。修法是 `-t` 直接用 `durationMs + 5s`。
+**先建管线，后 spawn curl。** 手工复现时「先起 curl 再起 gst」会丢掉开头几秒甚至整条流（`size=0`）；先起 gst（让它进 PREROLLING）、隔 1 秒再起 curl 就稳。native 侧对应的是「先建好管线、挂上 probe、再 spawn 写端」这个顺序。
 
-**`render-rectangle` 是 write-only 的，而且只在 reconfigure 时被读取。** 键盘避让需要动态改视频矩形。播放态直接设属性就生效，但暂停态怎么设都没用——kmssink 只在重新分配 plane 时才读这个属性，PAUSED 下没有新帧流过就不会 reconfigure。所以暂停态改矩形必须**先设属性、再临时脉冲 PLAYING 触发 reconfigure、设完立刻切回 PAUSED**。顺序反了（先脉冲再设）就是 configure 读到旧值，完全无效——我在这里踩过一次，还因为探针设计不当误判成"已修好"。
+**curl 的存活保护。** `--connect-timeout 8 --speed-limit 1024 --speed-time 20`。直播最常见的故障不是断连，而是「连接还在、CDN 不再推数据」——没有 `--speed-time`，curl 会永远挂着，上层看到进程活着、画面却永远不动。
 
-另外两个坑：`render-rectangle` 只能缩小不能放大（1×1 之后想恢复必须整条管线过一次 READY，走 seek 重启路径）；零宽高不会隐藏平面，kmssink 会回退成"未设置 ⇒ 全屏"，所以隐藏必须用 1×1。
+**斗鱼直链是一次性的。** 实测：全新 URL 用 curl 能拉满 20 秒（1,340,443 字节），**同一条 URL 第二次 GET 必定在 0.8 秒内 EOF**（216,325 字节），第三次 423,716 字节。所以重连**必须重新签名**，拿原 URL 重连注定失败 —— native 那 5 次重连配额实际只是「5 次快速失败 + 2~8 秒退避」，真正的续播靠 JS 换链。这也解释了早期「流只有 427KB 就断」的误判：不是 CDN 掐流，是 URL 复用。同理，验证链路的脚本**不能先 probe URL 再交给 curl**，probe 会消耗掉唯一那次额度。
 
-**起播要缓冲门，不能直接 PLAYING。** 直接 PLAYING 时，音频分支先 preroll 完成、管线时钟随即起跑，而视频分支（硬解首帧 + 队列排空）要晚 900~2100ms 才出帧，这批帧相对已经跑起来的时钟全部"迟到 >40ms"，被 `max-lateness` 成批丢弃——用户看到的就是"起播不是从头开始，直接从第 3 秒播"。修法是两段式：先 `set_state(PAUSED)`（时钟不走，没有帧会迟到），轮询等音视频分支都就绪，再切 PLAYING。代价是起播慢 1.7~2.4 秒，换来起播即满帧。
+### 签名取流
 
-注意这里**不能用 `get_state` 判断 preroll 是否完成**——我们的管线描述里刻意不放任何 sink（分支全靠 `pad-added` 动态建），`set_state(PAUSED)` 会立即返回 SUCCESS，那时一个分支都还没建。
+```
+GET /wgapi/livenc/liveweb/websec/getEncryption?did=<32hex>
+    -> {key, rand_str, enc_time, enc_data, expire_at}
 
-**直播不走 ffmpeg，直连 `souphttpsrc ! flvdemux`。** B 站直播 FLV 的 PTS 是绝对值（实测约 2854014 秒），ffmpeg 转封装后流式 matroskademux 面对"首 PTS 巨大"会永久停在 PREROLLING。同样的流 ffmpeg 先落普通文件再读就正常，所以是"FIFO 上的流式 demux 无法处理巨大起始 PTS"。点播 m4s 的 PTS 从 0 附近开始，所以点播没这个问题。
+f = rand_str
+重复 enc_time 次: f = md5(f + key)
+auth = md5(f + key + String(rid) + String(ts))          // ts = 秒
+
+GET /lapi/live/getH5PlayV1/<rid>
+    ?enc_data=..&tt=..&did=..&auth=..&cdn=&rate=<rate>
+    &ver=Douyu_224011102&iar=0&ive=0&prev=1&bs=2
+    -> error=0 时 data.rtmp_url + '/' + data.rtmp_live 就是可 curl 的 FLV 直链
+       data.multirates = [{name, rate, bit}]
+```
+
+必须记住的几条：
+
+- `ver` 必须是 `Douyu_224011102`。用 `Douyu_new` 服务端会返回**纯文本**「鉴权失败」而不是 JSON。
+- query 里必须带 `did`，且与 `getEncryption` 用的是同一个。
+- `iar=0` 才会遵守 `rate`（`iar=1` 恒给最高档）。
+- 每个档位必须**单独签名请求一次**。直接改 URL 里的 `_4000` 后缀会 403。
+- `rate` **不保证被遵守**：同一房间实测 `rate=0` 返回过 `4`、`rate=4` 返回过 `0`。服务端按房间实际可用档位就近取。
+- 错误语义：`HTTP 403` = 签名被拒；`error:-15` = 房间不存在**或未开播**；`error:-9` = 设备时钟偏差；`error:1000` = did 为空；`error:1003` = 签名失效；`error:1005` = 请求过频。
+- 分区列表路径里 **cid1 恒为 2**，不是分类树给的那个 cid1：`/gapi/rkc/directory/mixList/2_<cid2>/<page>`。而 `cid2=0` 必须走推荐段 `0_0`（`2_0` 返回 `code:0` 但 `rl` 为空，是个静默失败）。
 
 ### 直播闪屏：一个默认值引发的
 
-用户反馈"直播每 2~5 秒部分区域闪白一帧"。查这个 bug 花了很久，因为所有常规怀疑对象都排除了：
+`mppvideodec` 的 `ignore-error` **出厂默认是 true** —— 解码出错时不报错、照常输出一帧损坏画面。直播是长连接，丢包导致参考帧缺失时 P 帧会解出局部错位/发白的坏帧。
 
-- 平面元数据完全稳定（1ms 间隔采样 60 秒，18001 次采样，active/几何/格式/源全无变化）
-- 没有丢帧（`buffer late, dropping` 计数 0）
-- 解码器无错误、kmssink 无错误、dmesg 无异常
-- 帧率正常（30.25fps）、平面几何正常
-
-转折点是把画面录下来逐帧分析。**判定"闪白"的检测器改了三次**：整帧平均亮度会被换镜头误报，条带孤立变亮会被真实运动误报（导出的 PNG 肉眼看全是正常画面）。最后用**交替 A/B**（同一时段两种配置轮流跑，消除内容随时间变化的影响）才拿到可信数据：
-
-```
-ignore-error=true  （mppvideodec 出厂默认）→ 40 秒内 3 组 / 5 组闪白
-ignore-error=false（丢弃坏帧）             → 40 秒内 0 组 / 0 组闪白
-```
-
-另外三组对照排除了网络和显示链路：同一份流录成文件再硬解 0 组、ffmpeg 软解 0 组、直播流直接硬解 4 组。
-
-根因是 `mppvideodec` 的 `ignore-error` **出厂默认 true**——解码出错时不报错、照常输出一帧损坏画面。直播是长连接，丢包导致参考帧缺失时 P 帧会解出"部分区域错位/发白"的坏帧。软解会丢弃坏帧，所以软解干净；本地文件不丢包，所以文件干净。
-
-修法就是 `ignore-error=false max-errors=16`。
+PenBili 那边是用**交替 A/B**（同一时段两种配置轮流跑，消除内容随时间变化的影响）才拿到可信数据：`ignore-error=true` 在 40 秒内 3 组 / 5 组闪白，`false` 是 0 组 / 0 组。同一个默认值在直播管线里同样致命，所以这里的视频分支固定 `ignore-error=false max-errors=16`。
 
 ### 音画同步与音量
 
-**ts-offset 必须加在 kmssink，不能加在 alsasink。** 蓝牙耳机有 150ms 端到端延迟，需要把视频整体提前。但 alsasink 是管线的时钟提供者（`provide-clock` 默认 true，实测关掉后视频飙到 88~119fps），给它自己的输入加 ts-offset 等于把整条管线时间轴一起平移，视频是 slave、相对关系完全不变——实测三档偏移 `avSkewMs` 毫无变化。补偿必须落在不提供时钟的那一端。
+**`ts-offset` 只能加在 `kmssink`，不能加在 `alsasink`。** 蓝牙耳机有 150ms 端到端延迟，需要把视频整体提前。但 `alsasink` 是管线的时钟提供者（`provide-clock` 默认 true），给它自己的输入加偏移等于把整条时间轴一起平移，视频是 slave，相对关系完全不变 —— 实测三档偏移 `avSkewMs` 毫无变化。补偿必须落在不提供时钟的那一端。
 
-**播放器不拥有音量。** 早期版本每次 open/seek 都把 `Playback Path` 设成 SPK、`Master` 设成 100%，用户抱怨"一会儿有声音一会儿没声音"、"音量默认特别大"。现在只做两件事：读 Master 判断用户是否主动静音（是就不碰任何东西），以及仅在 `Playback Path == OFF` 时切到 SPK。**永不写 Master**——那是用户的音量设置，压 0 会销毁它且无法还原。
+**播放器不拥有音量。** 只做两件事：读 `card1 Master` 判断用户是否主动静音（是就不碰任何东西），以及仅在 `Playback Path == OFF` 时切到 SPK。**永不写 Master** —— 那是用户的设置，压 0 会销毁它且无法还原。
 
-**音量的权威源是系统滑杆，不是配置文件。** 这一条踩了三次。
-
-`hal-audio -s N`（控制中心和设置页背后的那个二进制）实测只写两个地方：`card1 Master`（numid 54）**立刻**、`/data/cfg/sys_config.conf` 的 `spk_volume` **约 10~12 秒后**。**它从头到尾不写 bluealsa 的 AVRCP 绝对音量**——早先我以为它写，其实那些写入是播放器自己干的，因果搞反了。
+**音量的权威源是系统滑杆，不是配置文件。** `hal-audio -s N`（控制中心和设置页背后的那个二进制）实测只写两处：
 
 | 位置 | 谁写 | 延迟 | 蓝牙路由下是否影响耳机 |
 | --- | --- | --- | --- |
@@ -176,36 +180,44 @@ ignore-error=false（丢弃坏帧）             → 40 秒内 0 组 / 0 组闪�
 | bluealsa AVRCP 绝对音量 | **只有播放器** | 立即 | ✅ 耳机硬件音量 |
 | `sys_config.conf` 的 `spk_volume` | `hal-audio -s` | 约 10~12 秒 | ❌ 只是个记录 |
 
-三次纠错的过程：
+所以：**滑杆意图 = `card1 Master`**（读它，立刻、准确、始终跟随用户）；**蓝牙路由下软件增益固定 1.0**，由 `apply_bt_avrcp_volume()` 用 `amixer -D bluealsa sset "<别名> - A2DP" N%` 把滑杆值**双向镜像**到 AVRCP。听感 = AVRCP = Master，线性无衰减；耳机本体按键调音量会在 1 秒内被拉回滑杆值。
 
-1. 最早把 `spk_volume` 当唯一权威。用户"拉大音量 → 立刻点视频"时 conf 里还是上一次的 0，起播读到 0 → 软件增益 0 → 无声。
-2. 改成蓝牙路由读 AVRCP。但 AVRCP 是**耳机硬件音量**，和软件增益是**串联**的两级：都设 76% 听感是 58%，都设 20% 只剩 4%。而且它不跟系统滑杆走。
-3. 现在（正确）：**滑杆意图 = `card1 Master`**（读它，立刻、准确、始终跟随用户）；**蓝牙路由下软件增益固定 1.0**，由 `apply_bt_avrcp_volume()` 把滑杆值**双向镜像**到 AVRCP。听感 = AVRCP = Master，线性无衰减。耳机本体按键调音量会在 1 秒内被拉回滑杆值。
+「双向」很关键：早先的版本为了「防止按读错的值把耳机压成静音」只升不降，结果系统滑杆向下调完全失效。
 
-`apply_bt_avrcp_volume()` 曾经有过"只升不降"的保护（防止按读错的值把耳机压成静音）。现在源头换成 Master、不存在读到旧值的前提，那条保护必须去掉——否则系统滑杆向下调完全失效。
+**蓝牙探测要认 `bluealsa:` 而不是 `bluealsa:DEV=`。** `bluealsa-aplay -L` 的真实输出是 `bluealsa:SRV=org.bluealsa,DEV=<MAC>,PROFILE=a2dp`。另外 `bluealsa-aplay` 在 X6 Pro 上会 stack smashing 崩溃，只能用来列设备，不能用它播。
+
+**蓝牙路由下只读 bluealsa，绝不回退读 Master。** 回退会导致「连上耳机没声音」——因为 Master 是扬声器功放的音量，跟耳机音量完全无关。
 
 ### 屏幕保活
 
-设备空闲 30 秒调暗、60 秒熄屏（出厂值）。播放中必须保活，但 `hal-screen keep` 本身只续 30 秒窗口，所以每 20 秒续一次。深熄态（`bl_power=4`）单次调用不够，要连发两次。
-
-`onHide` 必须停保活——应用在后台每 20 秒唤一次屏等于永不熄屏，既烧屏又费电。
+设备空闲 30 秒调暗、60 秒熄屏。`hal-screen keep` 只续 30 秒窗口，所以播放中每 20 秒续一次；深熄态（`bl_power=4`）单次调用不够，要连发两次。`onHide` 必须停保活 —— 应用在后台每 20 秒唤一次屏等于永不熄屏，既烧屏又费电。
 
 ### 代码结构
 
 ```
 src/
-  pages/index/index.vue   单页应用：浏览 4 tab + 播放 + 图文（3437 行）
+  pages/index/index.vue   单页应用：斗鱼浏览/播放 + B 站四个 tab + 图文（约 4250 行）
+  pages/diag/diag.vue     自检页（主界面没有入口，靠 adb 启动）
   services/
-    play_session.js       会话编排：解析流地址 → open → 轮询 → seek/recover/close
-    player.js             native player 模块封装（v2/v1 双实现，16 参数 open 契约）
+    douyu/api.js          签名取流：did / getEncryption / auth / getH5PlayV1 / 错误语义
+    douyu/cate.js         分类树 getLeftNav + 关键词→分类映射 getSearchRec
+    douyu/feed.js         分区房间列表 mixList + searchLive 兜底过滤
+    douyu/normalize.js    字段归一（封面/头像 CDN 拼接、热度格式化）
+    play_session.js       会话编排：解析流地址 → open → 轮询 → 换链 / seek / recover / close
+    player.js             native player 模块封装（16 参数 open 契约）
     screen.js             屏幕几何纯函数 + 保活 + 进度条几何
-    bili/                 接口层：client / wbi / playurl / live / article / reply / action / qrlogin
-  styles/base.less        全站样式
-native/csrc/              交叉编译的 JSAPI 原生模块（20 个 .c/.h，约 13.5k 行）
-test/run.js               单测（191 条）
+    input.js              系统输入法（发评论、搜关键词）
+    storage.js            持久化（内存镜像 + 串行写 + 回读校验）
+    bili/                 B 站接口层：client / wbi / playurl / live / article / reply / action / qrlogin
+  styles/base.less        全站样式（斗鱼新增类在 1357 行起的「斗鱼（PenDouyu 新增）」段，搜索行类在 1623 行起）
+  styles/var.less         主题变量（@accent = #FF5D23 斗鱼橙）
+native/csrc/              交叉编译的 JSAPI 原生模块（20 个 .c/.h，约 14.2k 行）
+test/run.js               纯逻辑单测（204 条）
+test/douyu_feed_test.js   斗鱼服务层联网冒烟（宿主机 node 跑，只发 GET）
+tools/                    图标生成 / 截图合成 / 部署 / ELF 校验
 ```
 
-页面只有两个（`index` 和 `diag`）。单页应用的理由是 falcon 页面切换开销大，浏览/播放/图文全用 `mode` 状态机在一个页面内切换。
+页面只有两个（`index` 和 `diag`）。单页应用的理由是 falcon 页面切换开销大，浏览/播放/图文全用 `mode` 状态机在一个页面内切换；斗鱼和 B 站则用 `site` 状态切数据源，两侧列表各自缓存，切回来不重拉。
 
 native 侧三个模块：
 
@@ -214,6 +226,22 @@ native 侧三个模块：
 | `libjsapi_player2.so` | **主实现**。进程内 GStreamer，worker 线程独占所有 Gst 对象——JS 线程碰不到任何 Gst 调用，所以不需要锁，也不可能阻塞 JS 线程 |
 | `libjsapi_player.so` | 旧实现（fb0 贴帧 + aplay），性能差，仅作回退 |
 | `libjsapi_httpjson.so` | 原始 POST body + 二进制 GET。运行时的 `$falcon.jsapi.http` 会对 data 做二次 JSON 序列化且无法关闭，导致部分服务端返回 422 |
+
+错误码（`core/queue.h:132-154`）：
+
+| 码 | 含义 | 码 | 含义 |
+| --- | --- | --- | --- |
+| 0 | NONE | 9 | BUSY |
+| 1 | BAD_ARG | 10 | SEEK |
+| 2 | BAD_INPUT | 11 | EOS |
+| 3 | BAD_HEADERS | 12 | PLANE_LOST |
+| 4 | BAD_RECT | 13 | TIMEOUT |
+| 5 | GST_INIT | 14 | INTERNAL |
+| 6 | PIPELINE（直播重连认输也报这个） | 15 | NO_FIRST_FRAME |
+| 7 | OPEN_FAILED | 16 | BRANCH_LINK |
+| 8 | NO_STREAM | **17** | **LIVE_RECONNECT** |
+
+17 号不在 `queue.h` 里，只定义在 `session.c:256` —— 它是会话级语义（「重连配额用完了，请换个新 URL」），不是单次管线操作的错误，所以故意没有放进那个枚举。JS 侧 `play_session.js:221` 的 `LIVE_RECONNECT_ERR = 17` 与它对得上。
 
 ---
 
@@ -227,25 +255,31 @@ native 侧三个模块：
 | aiot-vue-cli | 有道小程序打包器，1.0.32 验证 |
 | Zig | 交叉编译 native 库，0.16.0 验证 |
 | adb | 部署与调试 |
-| Python | 仅部分工具脚本用；依赖 PIL 的脚本要指定带 PIL 的解释器 |
+| Python | 仅工具脚本用。`tools/make_douyu_icon.py` 是纯标准库；`tools/compose_shot.py` 需要 PIL + numpy |
 
 ### 命令
 
 ```bash
-cd PenBili
+cd PenDouyu
 npm ci
 
-# 交叉编译 native（产出三个 .so 到 libs/）
+# 交叉编译 native（产出三个 .so 到 libs/，需要 Zig）
 npm run native
 
-# 打 AMR 包（产出 8002026110200001.3_5_4.amr，约 217 KB）
+# 打 AMR 包（产出 8002026110200002.1_0_0.amr，约 296 KB）
 npm run build
 
 # 单测
 npm test
+
+# 斗鱼服务层联网冒烟（宿主机跑，只发 GET，不写任何远端状态）
+node test/douyu_feed_test.js
+
+# 重做图标（从 .tmp_douyu_icon.png 放大 + 锐化）
+npm run icon
 ```
 
-`npm run native` 内部是 `powershell -File native/build.ps1`，默认 target 是 `aarch64`。X6 Pro 是 **aarch64 64 位**，装 32 位库会在 `dynamic_load_jsapi` 处直接报 `wrong ELF class: ELFCLASS32`。
+`npm run native` 内部是 `powershell -File native/build.ps1`，target 固定 `aarch64-linux-gnu.2.17`。X6 Pro 是 **aarch64 64 位**，装 32 位库会在 `dynamic_load_jsapi` 处直接报 `wrong ELF class: ELFCLASS32`。脚本末尾会自动跑 `python tools/inspect_elf.py <so> --target aarch64` 校验 ELFCLASS64 / machine 183（三份 `.so` 都必须过）。
 
 打包时出现下面这条告警是**正常的**：
 
@@ -255,65 +289,103 @@ npm test
 
 这三个是原生模块，由 `libs/` 里的 `.so` 提供，不是 JS 依赖。
 
+`找不到 theme "theme-dark"` 也是既有告警（`app.json` 里声明的主题在打包器侧没有对应表），不影响运行。
+
 ## 安装
 
 ```bash
-adb push 8002026110200001.3_5_4.amr /tmp/
-adb shell "miniapp_cli install /tmp/8002026110200001.3_5_4.amr"   # 必须返回 "ret":0
+adb push 8002026110200002.1_0_0.amr /tmp/
+adb shell "miniapp_cli install /tmp/8002026110200002.1_0_0.amr"   # 必须返回 "ret":0
 
 # 冷启动：先切桌面再起目标页，保证重建页面实例
 adb shell "miniapp_cli start 8080222437664451"
-adb shell "miniapp_cli start 8002026110200001 index"
+adb shell "miniapp_cli start 8002026110200002 index"
 ```
 
 几个容易踩的点：
 
 - `miniapp_cli start <appid> index` 里的页面名**不带** `--`，写成 `--index` 会报 `could not load module filename '--index.js'`
 - 直接 `start <appid>` 可能复用旧页面实例，改了代码看不到效果，所以要先切一次桌面
-- installer 会给 `.so` 加壳重打包（本地 95KB → 设备上 198KB 是正常的，md5 必然变）
+- installer 会给 `.so` 加壳重打包（本地 99808 → 设备上更大是正常的，md5 必然变）
 - 每次 install 会在 `a`/`b` 两个 slot 之间轮换，旧目录被删
+- Git Bash 下 `adb push` 到设备 `/tmp` 必须 `MSYS_NO_PATHCONV=1`，否则 `/tmp` 会被改写成 Windows 临时目录
 
 自检页只能这样进（主界面没有入口）：
 
 ```bash
-adb shell "miniapp_cli start 8002026110200001 diag"
+adb shell "miniapp_cli start 8002026110200002 diag"
 ```
+
+---
 
 ## 调试
 
-日志在 `/userdata/applog/`，`YD_PEN_APP.log` 含二进制字节，**必须 `grep -a`**。
+**日志。** 应用日志在 `/userdata/applog/`，`YD_PEN_APP.log` 含二进制字节，**必须 `grep -a`**。native 播放日志在 `/tmp/pb2.log`，用 `touch /tmp/pb2.enable` 或设 `PENBILI_PB2_LOG=1` 打开，格式 `[<秒>.<毫秒>] <msg>`。
 
-验证视频是否真的上屏，不能用 `miniapp_cli capture`——它抓的是 Falcon 画布，看不到硬件视频平面。要看 KMS 平面：
+**curl 的实际参数**会完整 dump 到 `/tmp/pb2/argv-curl.txt`。排查「Referer/UA 是不是串了站」全靠这个文件 —— 本项目真出过一次：斗鱼直播带着 B 站 Referer 去拉 CDN，根因是页面组装播放上下文时把 UA/Referer 写死成了 B 站的，现在按 `session.site` 分流。
+
+**验证视频是否真的上屏，不能用 `miniapp_cli capture`** —— 它抓的是 Falcon 画布，看不到硬件视频平面：
 
 ```bash
 adb shell "grep -a 'Esmart1-win0' -A9 /sys/kernel/debug/dri/0/summary"
 ```
 
-`Esmart1-win0` 就是视频平面（plane-id 76），`dst: pos[...] rect[...]` 是它当前的屏幕矩形。
+`Esmart1-win0` 就是视频平面（plane-id 76），`dst: pos[...] rect[...]` 是它当前的屏幕矩形，`format: NV12`、`buf pitch` 也在里面。
+
+**静音测试。** `touch /tmp/pb2_mute` 之后播放器全程不动 `Master`（优先级：文件 > 环境变量 `PB2_MUTE` > 默认不静音；每次调用都重新 stat，所以 `touch`/`rm` 立即生效）。想彻底不接声卡，就把音频分支的 `alsasink` 换成 `fakesink` 单独验。
+
+**触屏注入。** 设备没有 `input tap`，用 `/usr/bin/send_event`：
+
+```bash
+adb shell "send_event touch press <x> <y>"
+adb shell "send_event touch release <x> <y>"
+```
+
+它接的是**面板物理坐标**（480×960，rotation 270），不是逻辑坐标（960×266）：
+
+```
+panel_x = 107 + logical_y
+panel_y = 960 - logical_x
+```
+
+**抓平面帧。** 播放页截图需要单独抓 KMS 平面：
+
+```bash
+gst-launch-1.0 kmssrc plane-id=76 num-buffers=1 ! videoconvert ! pngenc ! filesink location=/tmp/plane.png
+```
+
+`tools/compose_shot.py` 会自动做完「读 summary 拿 dst → 抓帧 → 逆变换 → 贴回画布截图」这一串。注意它要跑在带 PIL + numpy 的解释器上（本仓库用 DSH 自带的 bundled python）。
 
 ---
 
 ## 已知限制
 
-- **只支持 X6 Pro**。X5 的 32 位 arm 分支已停止维护并转移到[PenBili-CVI](https://github.com/56dz/PenBili-CVI)
-- **无弹幕**。v2.7.0 移除，因为弱设备上逐帧文字渲染会拖垮解码
-- **无倍速播放**
-- **未登录时服务端最高只给 480P**
-- 起播比"直接开播"慢 1.7~2.4 秒，这是缓冲门的代价（换来起播即满帧，不从第 3 秒开始）
-- 直播延迟约 4 秒（视频队列深度就是延迟下限）
+- **只支持 X6 Pro**（aarch64）。X5 的 32 位分支在 [PenBili-CVI](https://github.com/56dz/PenBili-CVI)，本仓库不带
+- **无弹幕**。斗鱼弹幕是 WebSocket 二进制帧（`<u32 len><u32 len><i16 689><u8 0><u8 0><payload><0x00>`，STT 序列化），QuickJS 侧没有 websocket 能力
+- **直播无 seek**。直播态进度条位置换成「已播时长」文字
+- **斗鱼不进播放历史**。斗鱼房间没有 `bvid`，存下来就是死链
+- **播放页右列空着**。相关推荐没做，`.pright-fill` 是不透明兜底占位（防止底下的浏览内容透出来）
+- **图标仍是 B 站粉色系**。13 个 png 图标沿用 PenBili 的素材，主题色已经在 `var.less` 统一成斗鱼橙；只有应用图标（`app_icon.png`）是重新生成的斗鱼橙色鲨鱼
+- **卡片角标不压图**。「直播中」标是封面下方一条 12px 横条，不是压在封面左上角 —— Falcon 的 `position:absolute` 不可靠，压歪比不压更难看
+- **斗鱼搜索不保证精确**。「关键词 → 分类 → 本地过滤」，分类映射不上时会退化成「该分类全部房间」
+- **直播延迟约 4 秒**。视频队列深度就是延迟下限（`PB2_LIVE_VIDEO_QUEUE_NS = 4s`）
+- 起播比"直接开播"慢 0.7~2.4 秒，这是缓冲门的代价（换来起播即满帧，不从第 3 秒开始）
+- 蓝牙音量镜像的逻辑完整复用自 PenBili，但本机测试期间设备无蓝牙连接，**AVRCP 写入路径无法在真机上验证**
 
 ---
 
 ## 致谢
 
-- [SocialSisterYi/bilibili-API-collect](https://github.com/SocialSisterYi/bilibili-API-collect)：基本是照着这份接口文档把点赞、投币、收藏、评论一路接完的，省了大量抓包时间
+- [PenBili](https://github.com/56dz/PenBili)：整个项目的基础。B 站链路、native 播放器、屏幕几何、蓝牙音量镜像全部来自那里
+- [56dz/douyu-api](https://github.com/56dz/douyu-api)：斗鱼签名流程的参考实现，`getEncryption` / `getH5PlayV1` 的参数就是照着它对的
+- [SocialSisterYi/bilibili-API-collect](https://github.com/SocialSisterYi/bilibili-API-collect)：B 站接口文档
 - 有道 Falcon 小程序的官方示例与 `falcon-ui` 组件库：布局、样式和触摸事件行为都以它为准
 
 ## 免责声明
 
-- 本项目为个人学习用途，与哔哩哔哩、有道（网易）均无关联；相关商标归其权利人所有
+- 本项目为个人学习用途，与斗鱼、哔哩哔哩、有道（网易）均无关联；相关商标归其权利人所有
 - `native/iot-miniapp-sdk/include` 为有道小程序官方 SDK 头文件，仅作为 native 模块的编译依赖随仓库分发；版权归原权利人，不适用于本仓库 GPL-3.0 授权
-- 使用本软件访问服务时请遵守哔哩哔哩用户协议；账号安全责任自负
+- 使用本软件访问服务时请遵守相应平台的用户协议；账号安全责任自负
 - **无任何担保**；详见 LICENSE
 
 ## 许可证

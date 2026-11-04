@@ -1354,6 +1354,331 @@
   text-align: center;
 }
 
+/* ---------- 斗鱼（PenDouyu 新增） ----------
+ * 全部是本项目新增的类名，不覆盖任何 PenBili 既有规则；
+ * 唯一例外是 .bar-head / .dy-tab 与左栏旧规则同处 76px 栏内，
+ * 靠「写在后面」取胜（falcon 的 styler 没有真正特异性，同级同属性后写覆盖先写）。
+ * 铁律复习：① 不能用逗号选择器（falcon 只认单选择器，逗号会让后一个属性块变空）
+ *          ② flex 简写无效，必须 flex-grow/flex-shrink/flex-basis 三连
+ *          ③ position:absolute 不可靠，一切靠 flex 自然排列
+ *          ④ <text> 内容换行即不渲染（模板里不能给 text 折行） */
+
+/* 左栏顶部：logo(30) + 站点切换(30)，内宽 64 里塞两列 */
+.bar-head {
+  width: 64px;
+  height: 30px;
+  flex-direction: row;
+  align-items: center;
+}
+
+/* 覆盖 .bar-logo 的老 margin-left:17px —— 现在 logo 与切换按钮并排，居中会错位。
+   为什么不用后代选择器 .bar-head .bar-logo：falcon 的 styler 对组合选择器支持不可靠，
+   全项目既有的写法都是单类名（见 .favrow 那段踩坑注释）。
+   所以模板上挂两个类 .bar-logo + .bar-logo-h，靠「后定义覆盖」生效。 */
+.bar-logo-h {
+  margin-left: 2px;
+  margin-bottom: 0px;
+}
+
+/* 站点切换：竖排两格（斗鱼 / B站）。宽度只有 30px，8px 字号刚好放下两个字 */
+.sitesw {
+  width: 30px;
+  margin-left: 2px;
+  flex-direction: column;
+}
+
+.sitesw-btn {
+  width: 30px;
+  height: 13px;
+  margin-top: 1px;
+  border-radius: 3px;
+  justify-content: center;
+  align-items: center;
+  background-color: @card-background-color;
+}
+
+.sitesw-btn-on {
+  background-color: @accent;
+}
+
+.sitesw-text {
+  font-size: 8px;
+  color: @text-color-dim;
+  text-align: center;
+}
+
+.sitesw-text-on {
+  color: #FFFFFF;
+  font-weight: 600;
+}
+
+/* 一级分类竖排（推荐 + 5 个一级 = 6 个）。
+   高度预算必须算准，否则会把底部 .bar-status 挤成 0：
+     .bar 高 266 - 上下 padding 16 = 250
+     .bar-head 30 + 6×(30 + margin-top 2) 192 = 222
+     .bar-status margin-top 10 → 232，剩 18px 恰好一行 10px 文字。
+   再高 4px 就会让 .bar-status 的 flex-basis:0 + flex-shrink:1 收缩到不可见。 */
+.dy-tab {
+  width: 64px;
+  height: 30px;
+  margin-top: 2px;
+  border-radius: 8px;
+  justify-content: center;
+  align-items: center;
+  background-color: @background-color;
+}
+
+.dy-tab-on {
+  background-color: @accent;
+}
+
+.dy-tab:active {
+  opacity: 0.7;
+}
+
+.dy-tab-text {
+  font-size: 13px;
+  color: @text-color-dim;
+  text-align: center;
+  lines: 1;
+}
+
+.dy-tab-text-on {
+  color: #FFFFFF;
+  font-weight: 600;
+}
+
+/* 卡片：封面 166x93 + 下方 12px 角标条（见模板注释：不用 absolute 压图）。
+   .dy-cell 用 column：「图片在上、角标条在下」，高度不写死（166 宽由 .vrow 决定）。 */
+.dy-cell {
+  width: 166px;
+  flex-direction: column;
+}
+
+/* 角标条：行内三段 [直播中][弹性空白][热度]，靠 flex-grow 把热度顶到最右，
+   不用 justify-content:space-between（那个在 falcon 上被证实不稳，base.less 里有先例）。 */
+.dy-tagrow {
+  width: 166px;
+  height: 12px;
+  flex-direction: row;
+  align-items: center;
+}
+
+.dy-tagspacer {
+  flex-grow: 1;
+  flex-shrink: 1;
+  flex-basis: 0px;
+}
+
+.dy-live {
+  width: 32px;
+  height: 12px;
+  border-radius: 2px;
+  background-color: @accent;
+  color: #FFFFFF;
+  font-size: 8px;
+  text-align: center;
+  lines: 1;
+}
+
+.dy-hot {
+  width: 60px;
+  height: 12px;
+  color: @text-color-dim;
+  font-size: 9px;
+  text-align: right;
+  lines: 1;
+}
+
+/* 播放态左列：斗鱼直播把 72px 简介位换成三行实时信息（热度/已播/码率）。
+   复用 .pdesc 的盒子几何（193x72），只是里面从 scroller 换成三行 text。 */
+.dy-meta {
+  flex-direction: column;
+  justify-content: flex-start;
+}
+
+.dy-meta-row {
+  width: 193px;
+  height: 20px;
+  font-size: 11px;
+  color: @text-color;
+  lines: 1;
+  text-overflow: ellipsis;
+}
+
+/* 码率四档（2x2）。几何必须严丝合缝：
+   .pleft-btns 内宽 213 - 左右 padding 12 = 201；每个按钮 90 + 左右 margin 3+3 = 96，
+   两个一行 = 192 ≤ 201（留 9px 余量给 falcon 的像素取整）。
+   高度：74 - 上下 padding 8 = 66；每行 28 + 上下 margin 2+2 = 32，两行 = 64 ≤ 66。 */
+.dy-rate-row {
+  flex-direction: row;
+  flex-wrap: wrap;
+  justify-content: flex-start;
+  align-items: center;
+  padding-left: 6px;
+  padding-right: 6px;
+  padding-top: 4px;
+  padding-bottom: 4px;
+}
+
+.dy-rate {
+  width: 90px;
+  height: 28px;
+  margin-left: 3px;
+  margin-right: 3px;
+  margin-top: 2px;
+  margin-bottom: 2px;
+  border-radius: 8px;
+  border-width: 1px;
+  border-color: rgba(255, 255, 255, 0.12);
+  background-color: rgba(255, 255, 255, 0.07);
+  justify-content: center;
+  align-items: center;
+}
+
+.dy-rate:active {
+  opacity: 0.6;
+}
+
+.dy-rate-on {
+  background-color: @accent;
+  border-color: @accent;
+}
+
+.dy-rate-text {
+  font-size: 11px;
+  color: @text-color-dim;
+  text-align: center;
+  lines: 1;
+}
+
+.dy-rate-text-on {
+  color: #FFFFFF;
+  font-weight: 600;
+}
+
+/* 直播态进度条位置（26px）：本项目当前不在这里画任何东西 ——
+   直播视频平面是 469x266 的硬件 overlay，盖在这块 DOM 之上，画了也看不见。
+   「已播时长」放在左列 .dy-meta 里。这条规则保留是为了显式记录这个坑。 */
+.seek-live {
+  width: 469px;
+  height: 26px;
+  font-size: 10px;
+  color: @text-color-dim;
+  text-align: center;
+  lines: 1;
+}
+
+/* 二级分类横排（可换行）。斗鱼一级分类最多挂 18 个二级，864px 一行放不下，
+   所以和 B 站搜索用的 .stype-row（固定单行，不能改）分开定义。
+   宽度 870 与 .grid 一致，margin-left 7 对齐。 */
+.dy-chips {
+  width: 870px;
+  margin-left: 7px;
+  margin-bottom: 2px;
+  flex-direction: row;
+  flex-wrap: wrap;
+}
+
+.dy-chip {
+  width: 96px;
+  height: 28px;
+  margin-right: 8px;
+  margin-top: 4px;
+  border-radius: 8px;
+  justify-content: center;
+  align-items: center;
+  background-color: @card-background-color;
+}
+
+.dy-chip-on {
+  background-color: @accent;
+}
+
+.dy-chip:active {
+  opacity: 0.7;
+}
+
+.dy-chip-text {
+  width: 88px;
+  font-size: 12px;
+  color: @text-color-dim;
+  text-align: center;
+  lines: 1;
+  text-overflow: ellipsis;
+}
+
+.dy-chip-text-on {
+  color: #FFFFFF;
+  font-weight: 600;
+}
+
+/* 斗鱼紧凑搜索行（26px）。
+   为什么不复用 B 站的 .searchbar：那条是 46px 高 + margin-top 10 + margin-bottom 8，
+   总共吃掉 64px，而斗鱼内容区只有 250px、上面还有二级分类横排 —— 抄过来首屏直接少一整行卡片。
+   这里把「输入区」和「按钮」压在一行 26px 里：左侧 kw 区可点（拉起输入法），
+   右侧按钮在搜索态兼「返回」。
+   为什么 kw 区做成 12px 圆角小方块而不是透明条：笔的屏幕上透明可点区没有可见边界，
+   用户不知道哪块能点；给个描边框等于免费的可点性提示。 */
+.dy-search {
+  width: 870px;
+  height: 26px;
+  margin-left: 7px;
+  margin-bottom: 2px;
+  flex-direction: row;
+  align-items: center;
+}
+
+.dy-search-kw {
+  flex-grow: 1;
+  flex-shrink: 1;
+  flex-basis: 0px;
+  height: 24px;
+  margin-right: 8px;
+  padding-left: 10px;
+  padding-right: 10px;
+  border-radius: 6px;
+  border-width: 1px;
+  border-color: rgba(255, 255, 255, 0.14);
+  background-color: rgba(255, 255, 255, 0.06);
+  flex-direction: row;
+  align-items: center;
+}
+
+.dy-search-kw:active {
+  opacity: 0.7;
+}
+
+/* 单行省略：关键词可能很长，26px 行里绝不能换行顶出高度 */
+.dy-search-kw-text {
+  width: 720px;
+  font-size: 11px;
+  color: @text-color-dim;
+  lines: 1;
+  text-overflow: ellipsis;
+}
+
+.dy-search-btn {
+  width: 66px;
+  height: 24px;
+  border-radius: 6px;
+  background-color: @accent;
+  justify-content: center;
+  align-items: center;
+}
+
+.dy-search-btn:active {
+  opacity: 0.7;
+}
+
+.dy-search-btn-text {
+  font-size: 11px;
+  font-weight: 600;
+  color: #FFFFFF;
+  text-align: center;
+  lines: 1;
+}
+
 /* ---------- 扫码登录 ---------- */
 /* qr-box 228x228（v8 码 49+2×4 quiet ×4px），段宽全由 qr-l-N 静态类驱动（零 inline style） */
 .qr-wrap {

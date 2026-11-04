@@ -306,7 +306,11 @@ async function main() {
     LIVE_RECONNECT_ERR,
     SEEK_LAND_NEAR_MS,
     SEEK_LAND_DEADLINE_MS,
-    seekNoteDone
+    seekNoteDone,
+    LIVE_URL_TTL_MS,
+    LIVE_URL_REFRESH_MS,
+    shouldRefreshLiveUrl,
+    refreshLiveUrl
   } = await import('../src/services/play_session.js');
   const { fetchReplies, addReply, parseReplies, normalizeReply, replyType } = await import('../src/services/bili/reply.js');
   const { isAutotestSeedEnabled, readAutotestSeed } = await import('../src/services/autotest_seed.js');
@@ -2325,6 +2329,211 @@ async function main() {
     assert.strictEqual(describePlayError({ ok: false, stage: 'cancel', message: '已取消' }), '');
     assert.strictEqual(describePlayError({ ok: true }), '');
     assert.strictEqual(SEEK_STEP_MS, 20000);
+  });
+
+  /* ---------------- 直播直链 TTL / 主动换链（斗鱼 expire=300s） ----------------
+   * 背景：斗鱼 getH5PlayV1 的 FLV 直链带 expire=300（5 分钟），签名绑了
+   * (did, rid, ts, auth)。native 的断流重连用 open 时的原 URL，5 分钟后必然
+   * 403 —— JS 必须提前换链。改后缀/续 query 都过不了签名（实测改 _900→_4000
+   * 直接 403），只能重走 getEncryption → getH5PlayV1。 */
+  test('play_session: LIVE_URL_TTL_MS / LIVE_URL_REFRESH_MS 常量（换链留足余量）', () => {
+    assert.strictEqual(LIVE_URL_TTL_MS, 300000, '斗鱼 expire=300s');
+    assert.strictEqual(LIVE_URL_REFRESH_MS, 210000, '提前 90s 换链');
+    assert.ok(LIVE_URL_REFRESH_MS < LIVE_URL_TTL_MS, '换链阈值必须早于过期');
+    assert.ok(LIVE_URL_TTL_MS - LIVE_URL_REFRESH_MS >= 60000,
+      '余量要够走完两次签名请求 + 一次重试（实测单次 300~900ms，但 Wi-Fi 抖动远大于此）');
+  });
+  test('play_session: shouldRefreshLiveUrl 边界（纯函数，喂假 nowMs）', () => {
+    const T0 = 1000000;
+    // 非直播：点播的直链虽然也过期，但换链会打断播放位置 → 一律不换
+    assert.strictEqual(shouldRefreshLiveUrl({ live: false, liveUrlAt: T0 }, T0 + 9e9), false);
+    assert.strictEqual(shouldRefreshLiveUrl({ liveUrlAt: T0 }, T0 + 9e9), false, '缺 live 字段按非直播处理');
+    // liveUrlAt=0 / 缺失 = 「不知道这条链什么时候拿的」→ 不主动换（否则一开播就白换）
+    assert.strictEqual(shouldRefreshLiveUrl({ live: true, liveUrlAt: 0 }, T0 + 9e9), false);
+    assert.strictEqual(shouldRefreshLiveUrl({ live: true }, T0 + 9e9), false);
+    assert.strictEqual(shouldRefreshLiveUrl({ live: true, liveUrlAt: -1 }, T0 + 9e9), false);
+    // 阈值边界：**刚好等于**阈值就换（>=，不是 >）——晚一步就可能正好过期
+    assert.strictEqual(shouldRefreshLiveUrl({ live: true, liveUrlAt: T0 }, T0 + LIVE_URL_REFRESH_MS - 1), false);
+    assert.strictEqual(shouldRefreshLiveUrl({ live: true, liveUrlAt: T0 }, T0 + LIVE_URL_REFRESH_MS), true);
+    // 超过阈值
+    assert.strictEqual(shouldRefreshLiveUrl({ live: true, liveUrlAt: T0 }, T0 + LIVE_URL_REFRESH_MS + 1), true);
+    assert.strictEqual(shouldRefreshLiveUrl({ live: true, liveUrlAt: T0 }, T0 + LIVE_URL_TTL_MS), true);
+    // 防御：坏参数不 throw
+    assert.strictEqual(shouldRefreshLiveUrl(null, T0), false);
+    assert.strictEqual(shouldRefreshLiveUrl(undefined, T0), false);
+    assert.strictEqual(shouldRefreshLiveUrl('x', T0), false);
+    assert.strictEqual(shouldRefreshLiveUrl({ live: true, liveUrlAt: T0 }, NaN), false);
+    assert.strictEqual(shouldRefreshLiveUrl({ live: true, liveUrlAt: T0 }, undefined), false);
+  });
+  test('play_session: 斗鱼 item 走 douyu 取流分支（site 判别，不碰 B 站 client）', async () => {
+    const seen = [];
+    const ctx = {
+      // B 站 client 故意爆炸：斗鱼条目绝不该碰它
+      client: { request: async () => { throw new Error('不应该请求 B 站接口'); } },
+      videoSettings: {},
+      nowMs: () => 1700000000000,
+      douyuFetchPlayInfo: async (rid, rate) => {
+        seen.push([rid, rate]);
+        return {
+          ok: true,
+          rid: rid,
+          url: 'https://hwa.douyucdn2.cn/live/9_900.flv?wsAuth=a&expire=0',
+          rate: 2,
+          rates: [{ name: '高清', rate: 2, bit: 900 }]
+        };
+      }
+    };
+    const r = await resolveLiveUrl(ctx, { site: 'douyu', rid: 9, title: '斗鱼标题' });
+    assert.strictEqual(r.ok, true);
+    assert.strictEqual(r.live, true);
+    assert.strictEqual(r.site, 'douyu');
+    assert.strictEqual(r.audioUrl, '', 'FLV 自带音轨：回填会开第二条连接');
+    assert.strictEqual(r.durationMs, 0);
+    assert.strictEqual(r.roomid, 9);
+    assert.strictEqual(r.aid, 0);
+    assert.strictEqual(r.qn, 2, 'qn 用服务端实际档位');
+    assert.deepStrictEqual(seen, [[9, 2]], '未指定 ctx.douyuRate → 默认 rate=2（doc §3）');
+    assert.strictEqual(r.liveUrlAt, 1700000000000, 'liveUrlAt 必须来自 ctx.nowMs（可测）');
+    // 房间号非法 → param，不发请求
+    assert.strictEqual((await resolveLiveUrl(ctx, { site: 'douyu', rid: 0 })).stage, 'param');
+    // -15 = 未开播 → stage=offline（页面据此显示「主播未开播」而不是「取流失败」）
+    const off = await resolveLiveUrl(
+      Object.assign({}, ctx, { douyuFetchPlayInfo: async () => ({ ok: false, error: -15, errorText: '非法请求' }) }),
+      { site: 'douyu', rid: 9 }
+    );
+    assert.strictEqual(off.ok, false);
+    assert.strictEqual(off.stage, 'offline');
+    assert.ok(describePlayError(off).length > 0);
+    // 其它错误 → playurl
+    const bad = await resolveLiveUrl(
+      Object.assign({}, ctx, { douyuFetchPlayInfo: async () => ({ ok: false, error: 'AUTH_REJECTED', errorText: '签名被拒(403)' }) }),
+      { site: 'douyu', rid: 9 }
+    );
+    assert.strictEqual(bad.stage, 'playurl');
+    assert.strictEqual(bad.code, 'AUTH_REJECTED');
+  });
+  test('play_session: resolveVideoUrl 把 site=douyu 也路由到直播链', async () => {
+    const ctx = {
+      nowMs: () => 1,
+      douyuFetchPlayInfo: async () => ({ ok: true, url: 'https://x/1.flv', rate: 0, rates: [] })
+    };
+    const r = await resolveVideoUrl(ctx, { site: 'douyu', rid: 7 });
+    assert.strictEqual(r.ok, true);
+    assert.strictEqual(r.live, true);
+    assert.strictEqual(r.url, 'https://x/1.flv');
+  });
+  test('play_session: openVideo 直播透传 liveUrlAt / site / rates', async () => {
+    const w = fakePlayDeps({
+      nowMs: () => 1700000000123,
+      douyuFetchPlayInfo: async () => ({
+        ok: true,
+        url: 'https://hwa.douyucdn2.cn/live/9_900.flv?wsAuth=a',
+        rate: 0, // 服务端把 rate=2 降成了原画（实测行为）
+        rates: [{ name: '原画', rate: 0, bit: 10000 }]
+      })
+    });
+    const r = await openVideo(w, { site: 'douyu', rid: 9, title: 'T' });
+    assert.strictEqual(r.ok, true);
+    assert.strictEqual(r.session.live, true);
+    assert.strictEqual(r.session.kind, 'live');
+    assert.strictEqual(r.session.site, 'douyu');
+    assert.strictEqual(r.session.liveUrlAt, 1700000000123, 'liveUrlAt 必须透传到 session');
+    assert.strictEqual(r.session.qn, 0, '以服务端实际档位为准，不用请求的 2');
+    assert.strictEqual(r.session.douyuRate, 2, '换链要沿用**请求的**档位');
+    assert.strictEqual(r.session.rates.length, 1);
+    assert.strictEqual(w.calls.open[0].isLive, true, 'native 必须收到 live=1（否则走 ffmpeg 路径）');
+    assert.strictEqual(w.calls.open[0].input2, '', '单输入直连');
+    // 点播 session 的 liveUrlAt 恒 0（不需要换链，换链会打断播放位置）
+    const w2 = fakePlayDeps({ nowMs: () => 1700000000123 });
+    const r2 = await openVideo(w2, probeItem);
+    assert.strictEqual(r2.session.liveUrlAt, 0);
+    assert.strictEqual(r2.session.site, 'bili');
+  });
+  test('play_session: refreshLiveUrl 斗鱼 —— 重新签名取新链（绝不改后缀）', async () => {
+    const seen = [];
+    let n = 0;
+    const ctx = {
+      nowMs: () => 1700000300000,
+      douyuFetchPlayInfo: async (rid, rate) => {
+        seen.push([rid, rate]);
+        n++;
+        // 每次调用都是一条全新的 wsAuth/token（服务端按 ts 签名）
+        return {
+          ok: true,
+          url: 'https://hwa.douyucdn2.cn/live/' + rid + '_900.flv?wsAuth=sig' + n,
+          rate: 2,
+          rates: [{ name: '高清', rate: 2, bit: 900 }]
+        };
+      }
+    };
+    const session = { live: true, site: 'douyu', roomid: 9, douyuRate: 3, liveUrlAt: 1700000000000 };
+    assert.strictEqual(shouldRefreshLiveUrl(session, 1700000300000), true, '前置：确实到换链点了');
+    const r = await refreshLiveUrl(ctx, session);
+    assert.strictEqual(r.ok, true);
+    assert.strictEqual(r.url, 'https://hwa.douyucdn2.cn/live/9_900.flv?wsAuth=sig1');
+    assert.strictEqual(r.liveUrlAt, 1700000300000, '新链的取得时刻 = 现在');
+    assert.strictEqual(r.qn, 2);
+    assert.deepStrictEqual(seen, [[9, 3]], '沿用 session.douyuRate 重新签名，不是改 URL 后缀');
+    // 换完链 → shouldRefreshLiveUrl 立刻变 false（否则轮询会疯狂重取）
+    const next = { live: true, site: 'douyu', liveUrlAt: r.liveUrlAt };
+    assert.strictEqual(shouldRefreshLiveUrl(next, 1700000300000), false);
+    // opts.rate 可覆盖（用户切档）
+    const r2 = await refreshLiveUrl(ctx, session, { rate: 0, nowMs: 1800000000000 });
+    assert.deepStrictEqual(seen[1], [9, 0]);
+    assert.strictEqual(r2.liveUrlAt, 1800000000000);
+    // 失败：未开播 / 网络 —— 都返回结构化错误，不 throw
+    const off = await refreshLiveUrl(
+      Object.assign({}, ctx, { douyuFetchPlayInfo: async () => ({ ok: false, error: -15, errorText: '非法请求' }) }),
+      session
+    );
+    assert.strictEqual(off.ok, false);
+    assert.strictEqual(off.stage, 'offline');
+    const net = await refreshLiveUrl(
+      Object.assign({}, ctx, { douyuFetchPlayInfo: async () => ({ ok: false, error: 'NETWORK', errorText: 'curl: (6) 域名解析失败' }) }),
+      session
+    );
+    assert.strictEqual(net.ok, false);
+    assert.strictEqual(net.stage, 'playurl');
+    assert.ok(net.message.length > 0);
+    // 参数防御
+    assert.strictEqual((await refreshLiveUrl(ctx, null)).stage, 'param');
+    assert.strictEqual((await refreshLiveUrl(ctx, { live: false, roomid: 9 })).stage, 'param', '点播不换链');
+    assert.strictEqual((await refreshLiveUrl(ctx, { live: true, site: 'douyu' })).stage, 'param', '缺房间号');
+    // 取消标志
+    const canc = await refreshLiveUrl(
+      Object.assign({}, ctx, { cancelled: () => true }),
+      session
+    );
+    assert.strictEqual(canc.stage, 'cancel');
+  });
+  test('play_session: refreshLiveUrl B 站 —— 重打 getRoomPlayInfo（走 client，不碰斗鱼）', async () => {
+    let hits = 0;
+    const streams = [{
+      protocol_name: 'http_stream',
+      format: [{ format_name: 'flv', codec: [{
+        codec_name: 'avc', current_qn: 250, media_info: { width: 1280, height: 720 },
+        base_url: '/b.flv?', url_info: [{ host: 'https://d1.bilivideo.com', extra: 'e=1' }]
+      }] }]
+    }];
+    const ctx = {
+      nowMs: () => 555,
+      videoSettings: {},
+      douyuFetchPlayInfo: async () => { throw new Error('B 站会话不该走斗鱼取流'); },
+      client: { request: async () => { hits++; return { ok: true, data: { live_status: 1, playurl_info: { playurl: { stream: streams } } } }; } }
+    };
+    const r = await refreshLiveUrl(ctx, { live: true, roomid: 12345, liveUrlAt: 1 });
+    assert.strictEqual(r.ok, true);
+    assert.strictEqual(hits, 1, '必须真的重打 getRoomPlayInfo');
+    assert.ok(r.url.indexOf('https://d1.bilivideo.com') === 0, r.url);
+    assert.strictEqual(r.liveUrlAt, 555);
+    assert.strictEqual(r.qn, 250);
+    // 未开播透传 offline
+    const off = await refreshLiveUrl(
+      Object.assign({}, ctx, { client: { request: async () => ({ ok: true, data: { live_status: 0 } }) } }),
+      { live: true, roomid: 12345 }
+    );
+    assert.strictEqual(off.ok, false);
+    assert.strictEqual(off.stage, 'offline');
   });
   /* ---------------- native 数值归一化（review2 审计 P0-1） ----------------
    * 核心回归点：native 的"未测到"哨兵 **-1** 必须被归一回 0。

@@ -2,19 +2,53 @@
   <!-- page-live 只在「视频像素真的在 fb 上」时启用透明背景（见 base.less 注释）；
        未起播/起播失败/已播完时必须用不透明底色，否则会把上一屏的 fb 残留像素透出来。 -->
   <div :class="holeVisible ? 'page page-live' : 'page'">
-    <!-- 浏览态左栏：只有四个标签，不再有 PenBili 字样（用户要求删掉，把高度还给内容） -->
+    <!-- 浏览态左栏：站点切换(douyu/bili) + 标签列表。
+         斗鱼侧标签是「推荐 + 5 个一级分类」（fetchCategories 的 5 个一级），
+         B 站侧仍是原来的 4 个（推荐/热门/搜索/我的），两套各自维护互不影响。 -->
     <div v-if="mode === 'browse'" class="bar">
-      <!-- 软件 logo（用户要求 m07040-1：首页左上角加软件标志） -->
-      <image class="bar-logo" :src="ic.logo" :width="30" :height="30"></image>
-      <div
-        v-for="t in tabs"
-        :key="t.id"
-        :class="tab === t.id ? 'tab tab-on' : 'tab'"
-        @click="selectTab(t.id)"
-      >
-        <text :class="tab === t.id ? 'tab-text tab-text-on' : 'tab-text'">{{ t.label }}</text>
+      <div class="bar-head">
+        <!-- 软件 logo（用户要求 m07040-1：首页左上角加软件标志）。
+             图标仍是 PenBili 时期的粉色系 png（13 个），本版刻意不重做：
+             重画 13 张图的时间成本远高于收益，主题色已在 var.less 统一成斗鱼橙。 -->
+        <image class="bar-logo bar-logo-h" :src="ic.logo" :width="30" :height="30"></image>
+        <!-- 站点切换：竖排两格，宽度只有 30px（左栏内宽 64 = logo 30 + 4 + 切换 30） -->
+        <div class="sitesw">
+          <div
+            :class="site === 'douyu' ? 'sitesw-btn sitesw-btn-on' : 'sitesw-btn'"
+            @click="onSwitchSite('douyu')"
+          >
+            <text :class="site === 'douyu' ? 'sitesw-text sitesw-text-on' : 'sitesw-text'">斗鱼</text>
+          </div>
+          <div
+            :class="site === 'bili' ? 'sitesw-btn sitesw-btn-on' : 'sitesw-btn'"
+            @click="onSwitchSite('bili')"
+          >
+            <text :class="site === 'bili' ? 'sitesw-text sitesw-text-on' : 'sitesw-text'">B站</text>
+          </div>
+        </div>
       </div>
-      <text class="bar-status">{{ statusText }}</text>
+      <template v-if="site === 'douyu'">
+        <!-- 斗鱼一级分类（推荐=dyTop 0）。6 个 × 35px = 210，加上头部 30 与内边距仍在 266 内 -->
+        <div
+          v-for="c in dyTopTabs"
+          :key="'dyt' + c.id"
+          :class="dyTop === c.id ? 'dy-tab dy-tab-on' : 'dy-tab'"
+          @click="selectDyTop(c.id)"
+        >
+          <text :class="dyTop === c.id ? 'dy-tab-text dy-tab-text-on' : 'dy-tab-text'">{{ c.label }}</text>
+        </div>
+      </template>
+      <template v-else>
+        <div
+          v-for="t in tabs"
+          :key="t.id"
+          :class="tab === t.id ? 'tab tab-on' : 'tab'"
+          @click="selectTab(t.id)"
+        >
+          <text :class="tab === t.id ? 'tab-text tab-text-on' : 'tab-text'">{{ t.label }}</text>
+        </div>
+      </template>
+      <text class="bar-status">{{ site === 'douyu' ? dyStatus : statusText }}</text>
     </div>
 
     <!-- 播放态左列（用户手绘稿 m11950）：上=视频标题/简介(192)，下=点赞/投币/收藏(74) -->
@@ -24,13 +58,23 @@
           <image class="pback-icon" :src="ic.back" :width="22" :height="22"></image>
         </div>
         <text class="ptitle">{{ infoTitle }}</text>
-        <text class="pup">{{ infoUp }}</text>
+        <text class="pup">{{ pupText }}</text>
+        <!-- 斗鱼直播：简介位让给「热度 / 已播时长 / 当前码率」三行。
+             为什么不另起一行加高度：.pleft-info 是 192px 固定预算（26 返回 + 34 标题
+             + 14 主播 + 72 简介 + 16 提示 + 上下留白），随便加一行就会把末尾的
+             .pnote（重连中/加载中提示）挤出可视区。而斗鱼直播本来没有简介
+             （session.desc 为空），把这块 72px 换成实时信息是零成本交换。 -->
+        <div v-if="isDouyuPlay" class="pdesc dy-meta">
+          <text class="dy-meta-row">热度 {{ dyOnlineText || '—' }}</text>
+          <text class="dy-meta-row">已播 {{ liveElapsedText }}</text>
+          <text class="dy-meta-row">当前 {{ dyRateLabel }}</text>
+        </div>
         <!-- 简介必须可滚动（用户反馈：「播放界面出现长简介时，简介栏无法上下滑动，查看全部的」）。
              以前是 <text class="pdesc" lines:5>，超过 5 行直接省略号截断，用户没有任何办法看到全文。
              改成 scroller 后高度仍是 72px（192px 的左列预算是固定的，见 base.less .pleft-info
              注释），但内容可以上下滑动。内层 text 不能带 lines —— 带 lines 会在 scroller 里
              先被截断再滚，等于白滚。 -->
-        <scroller class="pdesc">
+        <scroller v-else class="pdesc">
           <text class="pdesc-text">{{ playDesc }}</text>
         </scroller>
         <!-- 播放提示（「定位中…」「加载中…」「音画不同步，正在恢复…」等）。
@@ -44,7 +88,8 @@
       </div>
       <!-- 三个按钮（点赞/投币/收藏）直播态隐藏（用户反馈 m07570-3）。
            直播没有「收藏夹」语义，点赞/投币对房间也不适用，留着只会占掉 74px
-           且点了没反馈。留空 div 保持 pleft 的 192+74 高度预算不变。 -->
+           且点了没反馈。这块 74px 在直播态改放码率四档按钮（见下面的 v-else 块），
+           高度预算 192+74 保持不变。 -->
       <div v-if="!isLivePlay" class="pleft-btns">
         <div class="pbtn" @click="onToggleLike">
           <image class="pbtn-icon" :src="act.like ? ic.likeOn : ic.like" :width="26" :height="26"></image>
@@ -59,6 +104,22 @@
           <text :class="act.fav ? 'pbtn-count-on' : 'pbtn-count'">{{ formatCount(act.favCount) }}</text>
         </div>
       </div>
+      <!-- 直播态：码率四档（2×2）。只在斗鱼直播显示 —— B 站直播的画质档是 qn(150/250)，
+           走的是「我的 → 直播」设置，不在这块 UI 里切换，动了会破坏 PenBili 既有行为。
+           高亮判据用 session.qn（服务端就近取档），不用 dyRate（请求值），否则
+           用户点「原画」而服务端给了蓝光时，按钮会骗人。 -->
+      <div v-else-if="isDouyuPlay" class="pleft-btns dy-rate-row">
+        <div
+          v-for="o in dyRateOptions"
+          :key="'dyr' + o.rate"
+          :class="play.session && play.session.qn === o.rate ? 'dy-rate dy-rate-on' : 'dy-rate'"
+          @click="onSwitchDyRate(o.rate)"
+        >
+          <text :class="play.session && play.session.qn === o.rate ? 'dy-rate-text dy-rate-text-on' : 'dy-rate-text'">{{ o.name }}</text>
+        </div>
+      </div>
+      <!-- B 站直播：留空保持 74px 预算（原逻辑：三个按钮都不适用） -->
+      <div v-else class="pleft-btns"></div>
     </div>
 
     <!-- 图文态左栏：纯图标工具条（评论开关）。
@@ -79,8 +140,88 @@
 
     <!-- 浏览内容 -->
     <div v-if="mode === 'browse'" class="content">
+      <!-- ===== 斗鱼（site==='douyu'，默认首页）===== -->
+      <scroller v-if="site === 'douyu'" class="list">
+        <!-- 紧凑搜索行（26px，压在二级分类之上）。
+             为什么只有 26px：内容区总共 250px，搜索行 26 + 二级分类 28 之后网格仍可滚，
+             不算挤压；而 B 站那条 .searchbar 是 46px 高再带上下 margin，抄过来会挤掉一整行卡片。
+             为什么整条 kw 区都可点：笔的触摸精度有限，26px 高的按钮太窄，
+             点整行都拉起输入法最省操作；右侧按钮专管「搜索 / 返回」，语义更清楚。
+             搜索态下二级分类行隐藏 —— 搜索结果是跨分类的，留着分类条会让人以为还能按类筛。 -->
+        <div class="dy-search">
+          <div class="dy-search-kw" @click="onOpenDyInput">
+            <text class="dy-search-kw-text">{{ dySearchHint }}</text>
+          </div>
+          <div class="dy-search-btn" @click="onDySearchBtn">
+            <text class="dy-search-btn-text">{{ dySearching ? '返回' : '搜索' }}</text>
+          </div>
+        </div>
+        <!-- 二级分类横排：只有在一级分类下才有意义（推荐一级的 sub 为空，横排只显示一个「推荐」）。
+             斗鱼一级分类最多挂 18 个二级（网游竞技/手游休闲），864px 一行放不下 18×96，
+             所以这里用能换行的 .dy-chips（.stype-row 是 B 站搜索用的单行固定布局，不能改它）。 -->
+        <div v-if="!dySearching && dyChips.length > 1" class="dy-chips">
+          <div
+            v-for="c in dyChips"
+            :key="'dyc' + c.cid2"
+            :class="dyCid2 === c.cid2 ? 'dy-chip dy-chip-on' : 'dy-chip'"
+            @click="selectDyCate(c.cid2)"
+          >
+            <text :class="dyCid2 === c.cid2 ? 'dy-chip-text dy-chip-text-on' : 'dy-chip-text'">{{ c.name }}</text>
+          </div>
+        </div>
+        <div class="grid">
+          <!-- 卡片：封面（166x93，与 B 站同一几何，Grid 5 列由 GRID_COLS 决定）+「直播中」橙标
+               + 热度 + 标题 + 主播名。
+               ⚠ 角标为什么在封面**下方一条 12px 的横排**、而不是压封面上：
+               falcon 的 position:absolute 不可靠（base.less:789 既有踩坑注释），
+               压图只能靠负 margin 硬推，真机上不同机型会飘 —— 而这里没有真机可验，
+               压歪比不压更难看。改成封面下方一条「直播中 ·……·  热度」的横条，
+               视觉上仍贴着封面、零风险。多出的 12px 由 scroller 吸收（列表本来就可滚）。
+               rid 不是 bvid，key 必须用 rid（斗鱼没有 bvid，这也是它不进播放历史的原因）。
+               数据源用 computed dyViewItems（搜索态→dySearchItems，浏览态→dyItems），
+               卡片结构两种状态**完全共用**这一段，不复制粘贴第二份 —— 两份以后必然改歪。 -->
+          <div v-for="it in dyViewItems" :key="'dy' + it.rid" class="vrow" @click="onPlayDouyu(it)">
+            <div class="dy-cell">
+              <image class="thumb" :src="it.cover" :width="166" :height="93"></image>
+              <div class="dy-tagrow">
+                <text class="dy-live">直播中</text>
+                <div class="dy-tagspacer"></div>
+                <text class="dy-hot">{{ it.onlineText }}</text>
+              </div>
+            </div>
+            <div class="vinfo">
+              <text class="vtitle">{{ it.title }}</text>
+              <text class="vmeta">{{ dyMeta(it) }}</text>
+            </div>
+          </div>
+        </div>
+        <!-- 底部两个按钮的语义按状态分叉：
+             浏览态 = 刷新本分类 / 加载更多；
+             搜索态 = 返回分类浏览 / 「没有更多了」（searchLive 无翻页参数，右侧只是状态提示、不挂 @click，
+             放个假按钮会让人反复点）。重搜的入口是搜索行本身：点 kw 区会带出 dyKeyword 预填。 -->
+        <div v-if="!dySearching && dyItems.length" class="more-row">
+          <div class="more-half" @click="selectDyCate(dyCid2)">
+            <text class="more-text">刷新</text>
+          </div>
+          <div class="more-half" @click="loadMoreDy">
+            <text class="more-text">{{ dyNoMore ? '没有更多了' : '加载更多' }}</text>
+          </div>
+        </div>
+        <div v-if="dySearching && dySearchItems.length" class="more-row">
+          <div class="more-half" @click="onExitDySearch">
+            <text class="more-text">返回分类浏览</text>
+          </div>
+          <div class="more-half">
+            <text class="more-text">没有更多了</text>
+          </div>
+        </div>
+        <div v-if="!dyViewItems.length && !dyViewLoading" class="empty">
+          <text class="empty-text">{{ dyStatus || (dySearching ? '没有搜到直播间 · 换个词试试' : '暂无直播 · 点左侧分类可重试') }}</text>
+        </div>
+      </scroller>
+
       <!-- 推荐 / 热门：封面卡片网格 + 底部（刷新 | 加载更多） -->
-      <scroller v-if="tab === 'rcmd' || tab === 'hot'" class="list">
+      <scroller v-else-if="tab === 'rcmd' || tab === 'hot'" class="list">
         <div class="grid">
           <div v-for="it in currentItems" :key="it.bvid" class="vrow" @click="onPlayItem(it)">
             <image class="thumb" :src="it.cover" :width="166" :height="93"></image>
@@ -296,9 +437,12 @@
           <text class="play-idle-text">{{ play.note || idleText }}</text>
         </div>
       </div>
-      <!-- 进度条直播态隐藏（用户反馈 m07570-3）。直播无时长、seek 无意义
-           （FLV 长连接不支持拖动），留着只会让用户白拖一次。
-           隐藏后 .pvideo 用 .pvideo-live 撑满 266px（见 base.less）。 -->
+      <!-- 直播态不渲染进度条（用户反馈 m07570-3：直播无时长、FLV 长连接不能拖）。
+           为什么不在这个 26px 位置改放「已播时长」文字：直播的 KMS 视频平面是
+           469x266 撑满整列的硬件 overlay（screen.js 的 LIVE_VIDEO_AREA，高 266），
+           它盖在 Falcon UI **之上** —— 在这里画的任何 DOM 用户都看不见。
+           所以「已播时长」放左列信息卡里（见 .pleft-info 里的 .dy-meta 三行：
+           热度 / 已播 / 当前码率），那里不在视频平面上，用户能看见。 -->
       <div
         v-if="!isLivePlay"
         class="seek"
@@ -562,6 +706,8 @@ import {
   isStreamEnded,
   isLiveEnded,
   isLiveReconnecting,
+  // 斗鱼直链一次性 → 重连/临期必须重新签名换链（见 DY_URL_REFRESH_MS 注释）
+  refreshLiveUrl,
   num,
   SEEK_STEP_MS,
   SEEK_FRAME_RETRY_DEADLINE_MS,
@@ -579,6 +725,17 @@ import {
   videoQualityLabel,
   liveQualityLabel
 } from '../../services/video_settings.js';
+/* 斗鱼直播（PenDouyu 相对 PenBili 的新增能力）。
+ * 服务层由 services 域提供，路径与契约见 docs/douyu-integration.md 第 2 节：
+ *   - cate.js      fetchCategories() → [{id, name, subs:[{cid1, cid2, name}]}]（失败返回 []）
+ *   - feed.js      fetchLiveList(cid2, page) → {ok, items, page, total}，cid2=0 表示推荐
+ *   - normalize.js 已由 feed.js 内部调用，条目含 site:'douyu' / rid / offline / onlineText
+ * 取流不走页面：play_session.js 的 resolveVideoUrl 已按 item.site==='douyu' 分流
+ * （resolveDouyuLiveUrl），矩形/帧率上限/isLive 全部自动处理 —— 页面只管传 ctx.douyuRate。 */
+import { fetchCategories } from '../../services/douyu/cate.js';
+import { fetchLiveList, searchLive } from '../../services/douyu/feed.js';
+// DOUYU_UA / DOUYU_REFERER 只在「直播换链后重开」用到（见 refreshDouyuLive）
+import { DEFAULT_RATE as DOUYU_DEFAULT_RATE, DOUYU_UA, DOUYU_REFERER } from '../../services/douyu/api.js';
 
 const TABS = [
   { id: 'rcmd', label: '推荐' },
@@ -703,12 +860,80 @@ const NO_FRAME_FAIL_MS = 15000;
  * （「该挂了吗」「该撤了吗」），写两遍字符串迟早拼错。 */
 const LIVE_RECONNECT_NOTE = '直播重连中…';
 
+/* ===== 斗鱼直播专用常量 =====
+ * 码率（rate）是斗鱼专有档位，与 B 站的 qn(150/250) 是两套体系，不能互相套用。
+ *   rate 0 = 原画（最高，可能 1080p+，弱网易卡）
+ *   rate 4 = 蓝光4M
+ *   rate 3 = 超清
+ *   rate 2 = 高清 900kbps（默认：真机实测最稳，起播最快）
+ * 服务端会「就近取档」，所以回显必须用 session.qn（见 dyRateLabel）。 */
+const DY_RATE_OPTIONS = [
+  { rate: 0, name: '原画' },
+  { rate: 4, name: '蓝光4M' },
+  { rate: 3, name: '超清' },
+  { rate: 2, name: '高清' }
+];
+
+// rate → 中文档位名（未知档位回退成 rate 数字串，别静默显示空白）
+function dyRateName(rate) {
+  const r = Number(rate);
+  for (let i = 0; i < DY_RATE_OPTIONS.length; i++) {
+    if (DY_RATE_OPTIONS[i].rate === r) return DY_RATE_OPTIONS[i].name;
+  }
+  return isNaN(r) ? '高清' : 'rate ' + r;
+}
+
+/* 斗鱼直链是「一次性」的：同一条 URL 第二次 GET 必然 0.8s 内 EOF（约 423KB），
+ * 所以 native 侧「用原 URL 重连」必定失败 —— 必须重新签名换链。
+ * play_session.js 已实现 refreshLiveUrl(ctx, session)：它调 fetchPlayInfo 重新签名，
+ * 并把新 url/liveUrlAt/qn 写回 session（不是给 URL 加后缀，加后缀会 403）。
+ * 这里只负责「什么时候换」：errcode=17 重连中，或者链接快过期（expire=300s）。
+ * LIVE_URL_REFRESH_MS=210000 是 play_session 的提前 90s 阈值，页面直接用同一口径。 */
+const DY_URL_REFRESH_MS = 210000;
+
 export default {
   name: 'PageBili',
   data() {
     return {
       tabs: TABS,
       searchTypes: SEARCH_TYPES_UI,
+      /* 站点切换：douyu（默认，斗鱼直播）/ bili（B 站，功能与 PenBili 完全一致）。
+       * 两侧数据各自独立保存，切回来不丢列表、不重拉。 */
+      site: 'douyu',
+      // 斗鱼一级分类（网游竞技/单机热游/手游休闲/娱乐/正能量）
+      dyCates: [],
+      // 当前一级分类 id（0 = 推荐，不走分类）
+      dyTop: 0,
+      // 当前二级分类 cid2（0 = 推荐，对应 mixList 的 0_0 段）
+      dyCid2: 0,
+      dyItems: [],
+      dyPage: 1,
+      dyTotal: 0,
+      dyNoMore: false,
+      dyLoading: false,
+      dyStatus: '',
+      // 请求码率：0 原画 / 4 蓝光4M / 3 超清 / 2 高清（默认 2，弱网最稳）
+      dyRate: DOUYU_DEFAULT_RATE,
+      // 当前正在播放的斗鱼条目（保存 onlineText/streamer/avatar 等，播放页左列要用）
+      dyPlaying: null,
+      // 开播时刻（ms）：直播没有 durationMs，用本机时钟算「已播时长」
+      dyStartedAt: 0,
+      // 已播秒数（由 startPoll 的 tick 每秒刷新）——computed 里不能直接读 Date.now()，
+      // 因为那不是响应式依赖，会让「已播」数字冻结（详见 liveElapsedText 注释）
+      dyElapsedSec: 0,
+      /* 斗鱼搜索（走 douyu/feed.js 的 searchLive）。
+       * 与 B 站的 keyword/searchResults 完全独立：两个站的关键词不该互相污染，
+       * 用户在斗鱼搜「英雄联盟」再切回 B 站，B 站原来的搜索词还得在。
+       *
+       * dySearching 是「模式开关」而不是「正在请求」：它决定网格渲染哪份数据、
+       * 二级分类条是否隐藏、底部按钮语义。请求中的 loading 复用 dyLoading 的思路，
+       * 单独用 dySearchLoading，避免和浏览态的加载状态互相覆盖。 */
+      dyKeyword: '',
+      dySearching: false,
+      dySearchItems: [],
+      dySearchNoMore: false,
+      dySearchPage: 1,
+      dySearchLoading: false,
       tab: 'rcmd',
       mode: 'browse', // browse=列表 | play=视频 | article=图文详情
       rcmdItems: [],
@@ -779,6 +1004,86 @@ export default {
     searchItems() {
       return this.searchResults[this.searchType] || [];
     },
+    /* ===== 斗鱼（site==='douyu'）视图模型 ===== */
+    /* 当前播放会话是不是斗鱼直播。session.site 由 play_session.js 的
+     * resolveDouyuLiveUrl 原样透传（openVideo 把 liveUrlAt/site/douyuRate/rates
+     * 一并放进 session），所以这里只需比对 site，不必再猜。 */
+    isDouyuPlay() {
+      return this.mode === 'play' && !!(this.play.session && this.play.session.site === 'douyu');
+    },
+    // 当前选中的一级分类对象（dyTop=0 时没有）
+    dyTopCate() {
+      for (let i = 0; i < this.dyCates.length; i++) {
+        if (this.dyCates[i].id === this.dyTop) return this.dyCates[i];
+      }
+      return null;
+    },
+    /* 二级分类横排：推荐(cid2=0) + 当前一级分类下的二级分类。
+     * 斗鱼分类树是一级 5 个 / 二级 55 个，一个横排塞不下 55 个，
+     * 所以左栏竖排选一级、内容区顶部横排选二级（两段式，别混成一个列表）。 */
+    dyChips() {
+      const out = [{ cid2: 0, name: '推荐' }];
+      const top = this.dyTopCate;
+      const subs = top && top.subs ? top.subs : [];
+      for (let i = 0; i < subs.length; i++) {
+        out.push({ cid2: subs[i].cid2, name: subs[i].name });
+      }
+      return out;
+    },
+    /* 左栏一级分类竖排：推荐(id=0) + fetchCategories 的 5 个一级。
+     * id=0 是「推荐」，走 mixList 的 0_0 段（不带分类），没有二级横排。 */
+    dyTopTabs() {
+      const out = [{ id: 0, label: '推荐' }];
+      for (let i = 0; i < this.dyCates.length; i++) {
+        out.push({ id: this.dyCates[i].id, label: this.dyCates[i].name });
+      }
+      return out;
+    },
+    /* 网格当前该渲染哪一份数据。模板只有一段 .grid（卡片那段共用），
+     * 靠这个 computed 切数据源，而不是复制两段模板 —— 复制出来的两份必然改歪。
+     * 搜索态优先：dySearching 为真时即使 dyItems 里还有旧分类数据也不显示。 */
+    dyViewItems() {
+      return this.dySearching ? this.dySearchItems : this.dyItems;
+    },
+    // 网格「无内容」判定的 loading 也得分状态，否则搜索时会被浏览态的 dyLoading 干扰
+    dyViewLoading() {
+      return this.dySearching ? this.dySearchLoading : this.dyLoading;
+    },
+    /* 搜索行显什么字：
+     *   有历史词（无论是否在搜索态）→ 显示那个词，让人知道「再点一下是重搜/修改」
+     *   从没搜过 → 提示语。提示语写「主播 / 游戏」而不是泛泛的「关键词」，
+     *   因为 searchLive 的匹配逻辑是 title + streamer 两个字段（见 feed.js matchKeyword）。 */
+    dySearchHint() {
+      if (this.dyKeyword) return this.dyKeyword;
+      return '搜索主播 / 游戏';
+    },
+    // 码率四档（模板用；顺序 = 原画/蓝光4M/超清/高清）
+    dyRateOptions() {
+      return DY_RATE_OPTIONS;
+    },
+    // 当前房间热度文案（服务层归一化时已算好 onlineText，别再自己换算单位）
+    dyOnlineText() {
+      return this.dyPlaying ? this.dyPlaying.onlineText || '' : '';
+    },
+    /* 直播「已播时长」：直播 durationMs=0、positionMs 也不可靠（换链会归零），
+     * 所以用本机时钟差。格式沿用 formatDuration，与点播进度条同一套。
+     *
+     * 为什么依赖 dyElapsedSec 而不是直接算 Date.now()：computed 只在其**响应式**
+     * 依赖变化时重算，Date.now() 不是响应式的 —— 直接写会让这个数字冻结在开播那一刻
+     * （真机表现为「已播 00:05」永远不动）。由 startPoll 的 tick 每秒写一次
+     * dyElapsedSec，才既准时又不额外起定时器。 */
+    liveElapsedText() {
+      if (!this.dyStartedAt) return '00:00';
+      /* formatDuration(0) 返回空串（点播场景里 0 时长要显示"没有"），
+       * 但直播刚开播那几秒必须显式显示 00:00，否则左列会闪一下空白。 */
+      return formatDuration(this.dyElapsedSec || 0) || '00:00';
+    },
+    // 当前实际码率档位：服务端会就近取档（请求 0 可能给 4），必须回显 session.qn
+    dyRateLabel() {
+      const s = this.play.session;
+      const r = s && s.qn != null ? s.qn : this.dyRate;
+      return dyRateName(r);
+    },
     // 评论面板返回按钮文案（跟随所在模式）
     commentsBackLabel() {
       return this.mode === 'article' ? '返回图文' : '返回播放';
@@ -806,6 +1111,19 @@ export default {
     },
     infoUp() {
       return this.play.session ? this.play.session.up : '';
+    },
+    /* 左列「主播名」行的内容：
+     *   斗鱼直播 → 主播名 · 热度（这一行只有 14px 高、193px 宽，热度写在这最省位置）
+     *   B 站（点播/图文/直播）→ 原样返回 session.up，绝不改变 PenBili 的既有展示。
+     * 注意别把 site 判断写反：斗鱼条目的 up 就是 streamer（onPlayDouyu 里赋的）。 */
+    pupText() {
+      if (this.isDouyuPlay) {
+        const up = this.infoUp || '';
+        const hot = this.dyOnlineText;
+        if (!hot) return up;
+        return up ? up + ' · ' + hot : hot;
+      }
+      return this.infoUp;
     },
     /* 当前播放会话是不是直播（用户反馈 m07570-3：「直播界面不应该出现评论区、
        三个按钮、和进度条」）。
@@ -926,6 +1244,11 @@ export default {
      *   _liveReconnectLogged = 「直播重连中…」是否已打过日志（避免每秒刷屏） */
     this._livePlayed = false;
     this._liveReconnectLogged = false;
+    /*   _dyRefreshing = 斗鱼换链进行中（防重入：换链要重新签名 + stop/open，
+     *                   一轮 tick 里若并发两次会把管线打断；同时它也是
+     *                   isLiveEnded 判据的让位开关 —— 换链期间 state 会短暂
+     *                   落回 idle，不加这个开关会被误判「直播已结束」）。 */
+    this._dyRefreshing = false;
     // 关键顺序：先恢复登录 Cookie（loadLocal），其末尾才发起首屏加载 ——
     // 否则首屏 rcmd 会以匿名身份发出，拿到的是默认推荐而非账号个性化推荐
     await this.loadLocal();
@@ -950,14 +1273,28 @@ export default {
     },
     // 每次操作独立 ctx：generation 变化即视为过期（过期回调不得更新页面）
     makeCtx(myGen) {
+      /* UA / Referer 必须跟着「正在播的是哪个站」走。
+       *
+       * 原先这里写死 bili 的 DEFAULT_UA / REFERER，斗鱼直播起播时 native 的
+       * curl 就带着 `-e https://www.bilibili.com/` 去拉斗鱼 CDN（真机实测
+       * /tmp/pb2/argv-curl.txt 里确实是 -e bilibili）。目前斗鱼 CDN 不校验
+       * Referer 所以还能 200，但这是随时会 403 的隐患，日志也像串了站。
+       *
+       * 判定用 play.session.site 而不是 this.site：播放中用户可能已经切回
+       * 别的站浏览，但「这条 ctx 正在播什么」才是语义。 */
+      const playingSite = (this.play && this.play.session && this.play.session.site) || this.site;
+      const isDy = playingSite === 'douyu';
       return {
         client: this.client,
         mixinMemo: this.mixinMemo,
         player: player,
-        mediaUa: DEFAULT_UA,
-        mediaReferer: REFERER,
+        mediaUa: isDy ? DOUYU_UA : DEFAULT_UA,
+        mediaReferer: isDy ? DOUYU_REFERER : REFERER,
         /* 「我的 → 视频调节 / 直播」的选择，play_session 用它算 qn 阶梯、像素预算、帧率上限 */
         videoSettings: this.videoSettings,
+        /* 斗鱼码率档位（0/4/3/2）。play_session 的 douyuRateFor(ctx) 优先读它，
+         * 缺省时回落到 DEFAULT_RATE(2)。切码率只要改 this.dyRate 再重开即可。 */
+        douyuRate: this.dyRate,
         nowSec: () => Math.floor(Date.now() / 1000),
         log: logWarn,
         cancelled: () => this.gen !== myGen
@@ -970,6 +1307,17 @@ export default {
       if (c) parts.push(c + '播放');
       const d = formatDuration(it.durationSec);
       if (d) parts.push(d);
+      return parts.join(' · ');
+    },
+    /* 斗鱼卡片副标题：主播名 · 分类。
+     * 为什么不直接在模板里写 `{{ it.streamer }}<template v-if="it.category"> · ...`：
+     * falcon 的模板对「文本插值 + 内嵌 template」的拼接实测会漏渲染后半段，
+     * 统一在方法里拼好字符串最稳（vmeta 也是这么做的）。 */
+    dyMeta(it) {
+      if (!it) return '';
+      const parts = [];
+      if (it.streamer) parts.push(it.streamer);
+      if (it.category) parts.push(it.category);
       return parts.join(' · ');
     },
     // 模板不能直接用模块导入 → 方法转发（图文/直播卡片计数展示）
@@ -1080,7 +1428,379 @@ export default {
         else if (probeLiveEnd && !hasAutoBody) await this.selectTab('rcmd'); // 只跑自证：停在正常首屏
         else this.runAutotest(soakSec, soakBv); // 自检内部自带首屏加载（避免与这里并发双 load 竞态）
       } else {
-        await this.selectTab('rcmd'); // 首屏加载：此刻登录 Cookie 已就位 → 个性化推荐
+        /* 首屏：site 默认 douyu → 拉斗鱼分类 + 推荐列表；若用户在「我的」里切到 bili，
+         * 则回到 PenBili 的老流程。斗鱼侧失败不阻塞，只写 dyStatus 让用户能重试。 */
+        await this.bootHome();
+      }
+    },
+
+    /* ---------- 斗鱼：分类 / 列表 ---------- */
+    /* 首屏入口：site 决定拉哪一侧。斗鱼侧失败只写 dyStatus（可重试），
+     * 绝不因此不显示页面 —— 这是用户开机第一屏，白屏比空列表糟得多。 */
+    async bootHome() {
+      if (this.site !== 'douyu') {
+        await this.selectTab('rcmd');
+        return;
+      }
+      await this.loadDyCategories();
+      await this.selectDyCate(0);
+    },
+    // 一级分类只拉一次（分类树是静态的，5 个一级 / 55 个二级）
+    async loadDyCategories() {
+      if (this.dyCates.length) return;
+      try {
+        const list = await fetchCategories();
+        if (Array.isArray(list) && list.length) {
+          this.dyCates = list;
+        } else if (!this.dyStatus) {
+          // 服务层失败返回 []，不 throw：给用户一条能看懂的兜底提示
+          this.dyStatus = '分类拉取失败，可先看推荐';
+        }
+      } catch (e) {
+        this.dyStatus = '分类拉取失败，可先看推荐';
+      }
+    },
+    // 选一级分类（左栏竖排）→ 重置到该类下的「推荐」二级
+    async selectDyTop(id) {
+      /* 搜索态下左栏分类仍然可见可点（那是全局导航，不该被搜索屏蔽）。
+       * 用户点分类的意图一定是「离开搜索结果去看分类」，所以先退出搜索再判断是否变化 ——
+       * 否则在搜索态点「当前已选中」的那个一级分类会命中下面的 early return，什么都不会发生，
+       * 表现为「点了没反应」的死键。 */
+      if (this.dySearching) this.onExitDySearch();
+      if (this.dyTop === id) return;
+      this.dyTop = id;
+      await this.selectDyCate(0);
+    },
+    // 选二级分类（内容区顶部横排）。cid2=0 表示推荐（mixList 的 0_0 段）
+    async selectDyCate(cid2) {
+      // 兜底：任何进入分类浏览的路径都要先离开搜索态（模板里搜索态已隐藏 chips，这里是防未来加别的入口）
+      if (this.dySearching) this.onExitDySearch();
+      const myGen = ++this.gen;
+      this.stopPoll();
+      this.dyCid2 = cid2 || 0;
+      this.dyItems = [];
+      this.dyPage = 1;
+      this.dyTotal = 0;
+      this.dyNoMore = false;
+      this.dyStatus = '';
+      await this.loadDyPage(myGen, 1, true);
+    },
+    /* 拉一页斗鱼列表。replace=true 覆盖（切分类），false 追加（加载更多）。
+     * total 是服务端总页数 pgcnt，用它判「没有更多」，不靠 items.length<pageSize 猜。 */
+    async loadDyPage(myGen, page, replace) {
+      this.dyLoading = true;
+      try {
+        const r = await fetchLiveList(this.dyCid2, page);
+        if (this.gen !== myGen) return;
+        if (!r || !r.ok) {
+          this.dyStatus = '加载失败：' + ((r && (r.errorText || r.error)) || '网络异常');
+          return;
+        }
+        const items = Array.isArray(r.items) ? r.items : [];
+        // 尾部裁到列数整数倍（与 B 站网格同一条规则：末行不满会露出半行残缺卡片）
+        const merged = replace ? items : this.dyItems.concat(items);
+        const cut = trimToGridRows(merged, GRID_COLS);
+        this.dyItems = cut.items;
+        this.dyPage = page;
+        this.dyTotal = r.total || 0;
+        /* 「没有更多」判定：服务端 pgcnt 是总页数，用它而不是 items.length<pageSize 猜
+         * （斗鱼末页可能就是不满的，猜法会漏一页）。裁掉的余数不算「有更多」。 */
+        this.dyNoMore = !items.length || (this.dyTotal > 0 && page >= this.dyTotal);
+        this.dyStatus = this.dyItems.length ? '' : '这个分类暂时没有直播间';
+      } catch (e) {
+        if (this.gen === myGen) this.dyStatus = '加载失败：网络异常';
+      } finally {
+        if (this.gen === myGen) this.dyLoading = false;
+      }
+    },
+    async loadMoreDy() {
+      if (this.dyLoading || this.dyNoMore) return;
+      await this.loadDyPage(this.gen, this.dyPage + 1, false);
+    },
+
+    /* ---------- 斗鱼：搜索 ---------- */
+    /* 搜索行右侧按钮：浏览态 = 拉起输入法，搜索态 = 退出搜索回分类浏览。
+     * 为什么不做成「一个按钮两种文案就够」：用户在搜索态想的是「我搜完了，回去」，
+     * 而在浏览态想的是「我要搜」。两个意图完全不同，靠状态分派比塞两个按钮省地方。 */
+    async onDySearchBtn() {
+      if (this.dySearching) {
+        this.onExitDySearch();
+        return;
+      }
+      await this.onOpenDyInput();
+    },
+    /* 拉输入法搜斗鱼。
+     * 与 B 站的 onOpenInput 三点差异：
+     *  1) 不切 tab、不动 B 站的三分栏缓存（两站搜索互不污染）
+     *  2) 用 dySearching 表达「进入搜索模式」，而不是靠一个 tab 值
+     *  3) searchLive 没有翻页参数 → 一次拿完，dySearchNoMore 恒 true（底部按钮不留假入口） */
+    async onOpenDyInput() {
+      const myGen = this.gen;
+      /* 系统输入法是独立系统 miniapp，拉起会触发宿主 onHide。
+       * 用 imBusy 让 onHide 跳过清理，否则 gen++ 会把确认结果丢掉（与 onOpenInput 同一坑）。 */
+      this.imBusy = true;
+      try {
+        const r = await input.open({
+          value: this.dyKeyword || '',
+          placeholder: '搜索主播 / 游戏',
+          maxlength: 30
+        });
+        if (this.gen !== myGen) return;
+        if (r && r.error) {
+          this.dyStatus = '输入法不可用(' + r.error + ')';
+          logWarn('[douyu] input open fail: ' + r.error);
+          return;
+        }
+        const kw = (r && r.confirmed && r.text ? r.text : '').trim();
+        // 日志卫生：只记长度不记内容（与 B 站搜索一致）
+        logWarn('[douyu] input confirmed=' + !!(r && r.confirmed) + ' kwLen=' + kw.length);
+        if (!kw) {
+          // 用户取消输入：搜索态保持原样，不把已有结果清掉
+          return;
+        }
+        this.dyKeyword = kw;
+        await this.runDySearch(myGen, kw);
+      } catch (e) {
+        this.dyStatus = '搜索失败：网络异常';
+        logWarn('[douyu] search exception: ' + (e && e.message ? e.message : e));
+      } finally {
+        this.imBusy = false;
+      }
+    },
+    /* 真正发搜索。抽出来是因为「重搜」和「首次搜」需要走同一条路径
+     * （搜索态点「重新搜索」也调它，不重复拉输入法）。 */
+    async runDySearch(myGen, kw) {
+      this.dySearching = true;
+      this.dySearchLoading = true;
+      this.dySearchItems = [];
+      this.dySearchPage = 1;
+      this.dySearchNoMore = true; // searchLive 无翻页参数
+      this.dyStatus = '搜索「' + kw + '」…';
+      try {
+        const r = await searchLive(kw, { size: 120 });
+        if (this.gen !== myGen) return;
+        if (!r || !r.ok) {
+          this.dyStatus = '搜索失败：' + ((r && (r.errorText || r.error)) || '网络异常');
+          this.dySearchItems = [];
+          logWarn('[douyu] search fail: ' + ((r && (r.errorText || r.error)) || 'unknown'));
+          return;
+        }
+        const raw = Array.isArray(r.items) ? r.items : [];
+        // 尾部裁到列数整数倍（与网格同一条规则：末行不满会露出半行残缺卡片）
+        const cut = trimToGridRows(raw, GRID_COLS);
+        this.dySearchItems = cut.items;
+        /* via='cate' 是服务层的语义：关键词命中了分类，但该分类里没人把关键词写进
+         * 标题/主播名 → 返回的是「这个分类的全部直播」。必须明说，否则用户会以为
+         * 搜索结果不相关是 bug。via='direct' 才是真的按词命中。 */
+        if (!cut.items.length) {
+          this.dyStatus = '没有搜到「' + kw + '」的直播';
+        } else if (r.via === 'cate') {
+          this.dyStatus = '未找到直接匹配，显示相关分类直播';
+        } else {
+          this.dyStatus = '搜索「' + kw + '」· ' + cut.items.length + ' 个结果';
+        }
+        logWarn(
+          '[douyu] search ok kwLen=' + kw.length + ' via=' + String(r.via) +
+          ' hits=' + raw.length + ' shown=' + cut.items.length +
+          (cut.trimmed ? ' trim=' + cut.trimmed : '')
+        );
+      } catch (e) {
+        if (this.gen !== myGen) return;
+        this.dyStatus = '搜索失败：网络异常';
+        this.dySearchItems = [];
+        logWarn('[douyu] search exception: ' + (e && e.message ? e.message : e));
+      } finally {
+        if (this.gen === myGen) this.dySearchLoading = false;
+      }
+    },
+    /* 退出搜索回分类浏览。
+     * 注意 dyKeyword 也一起清：留着的话搜索行会一直显示旧词，
+     * 而用户已经回到分类视图，看到「搜索行里还有词、网格却是分类」会困惑。
+     * 分类列表 dyItems 保留（浏览态数据本来就没被搜索覆盖过）。 */
+    onExitDySearch() {
+      this.dySearching = false;
+      this.dyKeyword = '';
+      this.dySearchItems = [];
+      this.dySearchPage = 1;
+      this.dySearchNoMore = false;
+      this.dySearchLoading = false;
+      this.dyStatus = '';
+      logWarn('[douyu] exit search → 回到分类浏览');
+    },
+    /* 站点切换（左栏顶部）：
+     *   douyu → 斗鱼分类/网格（默认）
+     *   bili  → 完全走 PenBili 原逻辑（推荐/热门/搜索/我的/登录/图文 全部保留）
+     * 两侧数据各自缓存，切回来不重拉、不丢位置。 */
+    async onSwitchSite(site) {
+      const s = site === 'bili' ? 'bili' : 'douyu';
+      if (this.site === s) return;
+      this.site = s;
+      this.statusText = '';
+      if (s === 'douyu') {
+        /* 搜索态直接原样恢复搜索态（两站各存各的，切走再切回来不该丢掉搜索结果）。
+         * 只有「从未浏览过任何分类」时才回到分类首屏。 */
+        if (!this.dySearching && !this.dyItems.length) {
+          await this.loadDyCategories();
+          await this.selectDyCate(this.dyCid2);
+        }
+        return;
+      }
+      // 回 B 站：恢复它的 tab 列表（selectTab 内部按需拉取）
+      await this.selectTab(this.tab === 'mine' || this.tab === 'search' ? 'rcmd' : this.tab);
+    },
+
+    /* ---------- 斗鱼：播放 ---------- */
+    /* 打开斗鱼直播间。与 onPlayItem（B 站）的三点刻意差异：
+     *  1) 不写播放历史：history.js 的深度链接是 bvid，斗鱼没有 bvid，
+     *     写进去只会得到一条点不开的死链（不为它改 services 域）。
+     *  2) 不碰 replyCtx/loadReplies/refreshAct：斗鱼 aid=0，打 B 站评论/互动接口
+     *     纯属浪费，还会在日志里刷 404 噪声掩盖真问题。
+     *  3) 取流不走页面：openVideo 内部按 item.site==='douyu' 分流到
+     *     resolveDouyuLiveUrl（自动算矩形/帧率/isLive，并透传 liveUrlAt/rates）。 */
+    async onPlayDouyu(it) {
+      if (!it) return;
+      const myGen = ++this.gen;
+      this.stopPoll();
+      this.mode = 'play';
+      /* 「已播时长」的起点（注意必须在覆盖 dyPlaying 之前取旧 rid）：
+       *   换房间（rid 变了）→ 必须清零重算，否则会继承上一个房间的时长；
+       *   同一房间换码率（onSwitchDyRate 里会暂存再补回）→ 不清零，用户还在看同一个直播；
+       *   同一房间重连接管 → 也不清零（上面这个 !dyStartedAt 判断自然保住）。 */
+      const prevRid = this.dyPlaying && this.dyPlaying.rid ? this.dyPlaying.rid : 0;
+      const nextRid = it.rid || 0;
+      this.dyPlaying = it;
+      if (!this.dyStartedAt || (prevRid && prevRid !== nextRid)) {
+        this.dyStartedAt = Date.now();
+        this.dyElapsedSec = 0;
+      }
+      this.seekDragMs = null;
+      this.cinText = '';
+      this.commentsOpen = false;
+      this.favOverlay = false;
+      this.replyCtx = { oid: 0, type: 1 };
+      this.play = {
+        state: 'loading',
+        session: {
+          kind: 'live',
+          live: true,
+          site: 'douyu',
+          roomid: it.rid || 0,
+          bvid: 'live:' + (it.rid || 0),
+          cid: 0,
+          title: it.title || '',
+          up: it.streamer || '',
+          desc: '',
+          cover: it.cover || '',
+          durationMs: 0,
+          qn: 0
+        },
+        positionMs: 0,
+        frames: 0,
+        note: ''
+      };
+      const ctx = this.makeCtx(myGen);
+      await closeSession(ctx); // 幂等：防止 PLAYER_ALREADY_RUNNING
+      if (this.gen !== myGen) return;
+      const r = await openVideo(ctx, it);
+      if (this.gen !== myGen) {
+        if (r && r.ok) await closeSession(this.makeCtx(this.gen));
+        return;
+      }
+      if (!r.ok) {
+        if (r.stage === 'cancel') return;
+        this.play.state = 'error';
+        this.play.note = describePlayError(r);
+        logWarn('[douyu] open fail stage=' + r.stage + ': ' + r.message);
+        return;
+      }
+      this.play.session = r.session;
+      /* ⚠ 补主播名：openVideo 造 session 时读的是 item.up（B 站字段），
+       * 而斗鱼条目用的是 item.streamer（normalizeRoom 的字段名），于是
+       * session.up 会是空串 —— 左列 .pup 那行就只剩热度，主播名丢了。
+       * 只在缺失时补，避免覆盖将来 services 层真把 up 填好的情况。 */
+      if (!this.play.session.up) this.play.session.up = it.streamer || '';
+      this.play.state = 'playing';
+      this.play.note = '';
+      this.startKeepScreen(); // 直播同样要保活（暂停思考时也不能黑屏）
+      this._avRecoverCount = 0;
+      this.startPoll(myGen);
+      logWarn(
+        '[douyu] play start rid=' + it.rid + ' reqRate=' + this.dyRate +
+        ' qn=' + r.session.qn + ' live=' + (r.session.live === true)
+      );
+    },
+    /* 切码率：0 原画 / 4 蓝光4M / 3 超清 / 2 高清。
+     * 斗鱼直链按 rate 签名，所以切档 = 重新取流重开（不能原地改档）。
+     * 注意回显要用 session.qn：服务端会就近取档（请求 0 可能给你 4），
+     * 用 dyRate（请求值）显示会骗用户。 */
+    async onSwitchDyRate(rate) {
+      const r = Number(rate);
+      if (isNaN(r) || r === this.dyRate) return;
+      this.dyRate = r;
+      const cur = this.dyPlaying;
+      if (cur && this.isDouyuPlay) {
+        /* 换档 = 重新取流重开。但「已播时长」不该清零 —— 用户视角还在看同一个直播间，
+         * 而 onPlayDouyu 只在 dyStartedAt 为 0 时才写，所以这里先暂存再补回。 */
+        const started = this.dyStartedAt;
+        await this.onPlayDouyu(cur);
+        this.dyStartedAt = started || Date.now();
+      }
+    },
+    /* 换链（斗鱼直链一次性，见 DY_URL_REFRESH_MS 注释）。
+     * 触发条件：native 报 errcode=17 重连中，或链接临近 expire(300s)。
+     * refreshLiveUrl 内部重新签名（fetchPlayInfo），返回新的 url/liveUrlAt/qn；
+     * 拿到新链后必须用新 url 重开播放器，不能指望 native 用旧 URL 重连。 */
+    async refreshDouyuLive(myGen, st) {
+      const s = this.play.session;
+      if (!s || s.site !== 'douyu' || s.live !== true) return;
+      if (this._dyRefreshing) return;
+      const liveAt = Number(s.liveUrlAt) || 0;
+      const expired = liveAt > 0 && Date.now() - liveAt >= DY_URL_REFRESH_MS;
+      const reconnecting = isLiveReconnecting(st, true);
+      if (!expired && !reconnecting) return;
+      this._dyRefreshing = true;
+      const ctx = this.makeCtx(myGen);
+      try {
+        const r = await refreshLiveUrl(ctx, s);
+        if (this.gen !== myGen) return;
+        if (!r || !r.ok) {
+          logWarn('[douyu] refresh fail: ' + ((r && (r.message || r.stage)) || 'unknown'));
+          return;
+        }
+        // 先停再开：player2 对「运行中再次 open」的行为不稳，stop 是幂等的
+        await player.stop();
+        const rect = s.rectPhysical || { x: 213, y: 0, width: 469, height: 266 };
+        const o = await player.openSession({
+          input: r.url,
+          input2: '',
+          startMs: 0,
+          durationMs: 0, // 直播：时长未知
+          fps: 30,
+          audio: true,
+          transpose: 2,
+          rect: rect,
+          audioDevice: '',
+          userAgent: DOUYU_UA,
+          referer: DOUYU_REFERER,
+          fpsCap: 30,
+          isLive: true
+        });
+        if (this.gen !== myGen) return;
+        if (!o || !o.ok) {
+          logWarn('[douyu] reopen fail: ' + ((o && (o.code || o.message)) || 'unknown'));
+          return;
+        }
+        // 写回会话：liveUrlAt 不更新会导致每秒都判「到期」，qn 变了要同步给 UI
+        if (r.liveUrlAt) s.liveUrlAt = r.liveUrlAt;
+        if (r.qn != null) s.qn = r.qn;
+        if (r.douyuRate != null) s.douyuRate = r.douyuRate;
+        if (r.rates) s.rates = r.rates;
+        this._livePlayed = false; // 重新起播：等下一帧再算「曾经 playing」
+        logWarn('[douyu] relink ok qn=' + s.qn);
+      } catch (e) {
+        logWarn('[douyu] relink exception: ' + (e && e.message ? e.message : e));
+      } finally {
+        this._dyRefreshing = false;
       }
     },
 
@@ -1575,6 +2295,7 @@ export default {
       /* 直播会话状态按会话重置（P1-4）：换一场直播要重新判定「有没有播起来过」。 */
       this._livePlayed = false;
       this._liveReconnectLogged = false;
+      this._dyRefreshing = false; // 新会话没有在途的换链
       const tick = async () => {
         if (this.gen !== myGen) {
           this.stopPoll();
@@ -1720,7 +2441,16 @@ export default {
          * 但万一日后实现改了把它置回 idle，也不能把「重连中」误报成「已结束」——
          * 这两个提示的语义完全相反（等一会儿就好 vs 别等了）。 */
         const liveReconnecting = isLivePlay && isLiveReconnecting(st, isLivePlay);
-        if (!seekBusy && !liveReconnecting && isLiveEnded(st, isLivePlay, this._livePlayed)) {
+        /* ---------- 斗鱼换链（必须在终止判据之前） ----------
+         * 斗鱼直链是一次性的（同一 URL 第二次 GET 必 EOF），native「用原 URL 重连」
+         * 必定失败，所以 errcode=17 或链接临近 expire 时必须重新签名拿新链。
+         * 放在 isLiveEnded 之前判：换链期间 state 可能短暂落回 idle，若先跑终止判据
+         * 就会把「正在换链」误报成「直播已结束」，语义正好相反。
+         * 不 await：换链要 1~2 秒，等它会把同一 tick 里的其他看门狗全拖慢。 */
+        if (isLivePlay && this.play.session && this.play.session.site === 'douyu') {
+          this.refreshDouyuLive(myGen, st);
+        }
+        if (!seekBusy && !liveReconnecting && !this._dyRefreshing && isLiveEnded(st, isLivePlay, this._livePlayed)) {
           this.play.state = 'ended';
           this.play.note = ''; // 清掉「直播重连中…」之类残留
           this.play.frames = st.frames;
@@ -1904,6 +2634,13 @@ export default {
          * native 位置拉回去，表现为"拖完往左弹一下"。首帧到达后再交回 native。 */
         if (!seekWaiting) this.play.positionMs = st.positionMs;
         this.play.frames = st.frames;
+        /* 斗鱼直播「已播时长」：每秒在这里推进一次。
+         * 为什么不放进 computed：Date.now() 不是响应式依赖，computed 不会因时间流逝重算，
+         * 结果就是数字冻在开播那一刻。这个 tick 本来就在跑（1s 一次），白捡一个时钟。
+         * 直播期间换链不影响 dyStartedAt，所以「已播」是真正的观看时长，不会因为重连归零。 */
+        if (this.play.session && this.play.session.site === 'douyu' && this.dyStartedAt) {
+          this.dyElapsedSec = Math.max(0, Math.floor((Date.now() - this.dyStartedAt) / 1000));
+        }
         /* 直播「曾经播起来过」的事实记录（P1-4）：主播下播就在我们点进去的瞬间发生时，
          * 轮询（1s 一次）可能一次都抓不到 playing，只有 idle —— 若不留这条历史，
          * isLiveEnded() 就只能靠 frames>0 兜底（位置不行：直播位置是墙钟，一进页面就有值）。
@@ -2631,6 +3368,12 @@ export default {
       await closeSession(this.makeCtx(myGen));
       this.mode = 'browse';
       this.play = idlePlay();
+      /* 离开播放页就把「已播时长」的起点清掉：下次点进任何房间都从 00:00 开始。
+       * 不清的话，回到列表再进来（哪怕换到别的房间）会继承上一次的计时起点。
+       * dyPlaying 也一起清 —— liveElapsedText/pupText 都靠它判断当前房间。 */
+      this.dyStartedAt = 0;
+      this.dyElapsedSec = 0;
+      this.dyPlaying = null;
       logWarn('[bili] back to browse');
     },
     /* ---------- 扫码登录 ---------- */

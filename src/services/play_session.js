@@ -10,11 +10,58 @@
 // gst mppvideodec 硬解上屏」。软解时代的像素预算已由 pixelBudgetFor（用户设置）取代。
 import { QN_LADDER, HTML5_FPS, buildPlayurlQuery, parseHtml5Response, parseDashResponse, validateStreamUrl } from './bili/playurl.js';
 import { fetchLivePlayUrl, LIVE_FPS } from './bili/live.js';
+/* 斗鱼取流只在 resolveLiveUrl/refreshLiveUrl 的 douyu 分支用到；静态 import 而不是动态
+ * import()，因为 aiot-vue-cli 的打包对动态 import 支持不稳（QuickJS 侧也没有独立的
+ * chunk 加载器）。douyu/api.js 自身不发起请求，import 是纯函数副作用为零。 */
+import { fetchPlayInfo as douyuFetchPlayInfo, DEFAULT_RATE as DOUYU_DEFAULT_RATE } from './douyu/api.js';
 import { deriveMixinKey } from './bili/wbi.js';
 import { playVideoRects, LIVE_VIDEO_AREA } from './screen.js';
 import { dashLadderFor, videoFpsCapFor, liveFpsCapFor, liveQnFor, pixelBudgetFor } from './video_settings.js';
 
 export const SEEK_STEP_MS = 20000;
+
+/* ===================== 直播直链 TTL / 主动换链 =====================
+ *
+ * 斗鱼（doc §1）：getH5PlayV1 给的 FLV 直链自带 `expire=300`（**5 分钟**），
+ * 且签名里绑了 ts + auth —— 过期后 CDN 直接 401/403，改后缀或续 query 都会
+ * 被签名校验拒掉（实测把 `_900` 改成 `_4000` 即 403）。唯一正确的续播方式是
+ * 用 session.roomid **重新签名**再取一条新链（getEncryption → getH5PlayV1）。
+ *
+ * 为什么要在 JS 侧主动换而不是等 native 断了再说：native 的断流重连用的是
+ * open 时下发的原 URL，5 分钟到点后它怎么重试都只会失败 → 用户看到「一直在
+ * 重连」。JS 必须在直链死之前把新 URL 换进去（native 侧 setInput 或重开）。
+ *
+ * 为什么阈值是 210s 而不是贴着 300s：换链要走两次网络请求（getEncryption 可能
+ * 命中缓存 + getH5PlayV1），笔端实测单次 300~900ms，叠加 Wi-Fi 抖动 / 换链
+ * 失败后还要有一次重试窗口，留 90s 余量才安全。B 站直播（约 1~2h 有效期）
+ * 同样适用这个保守阈值，多换几次成本只是一次 GET。
+ * ========================================================================= */
+export const LIVE_URL_TTL_MS = 300000; // 斗鱼直链 expire=300s
+export const LIVE_URL_REFRESH_MS = 210000; // 提前 90s 换链
+
+/**
+ * 是否该给这个直播会话换一条新直链（纯函数，nowMs 由调用方喂，便于单测）。
+ *
+ * 三个条件缺一不可：
+ *   - session.live === true：点播的直链带 deadline（约 2h）但换链没有意义
+ *     （点播可以 seek/续播，换链会打断播放位置），只对直播做。
+ *   - liveUrlAt > 0：0 表示「不知道这条链是什么时候拿的」（老会话/恢复出来的
+ *     会话没有这个字段）→ 不主动换，避免一开播就白换一条。
+ *   - nowMs - liveUrlAt >= LIVE_URL_REFRESH_MS：到点换。
+ *
+ * @param {{live?: boolean, liveUrlAt?: number}} session
+ * @param {number} nowMs 毫秒时间戳（单测喂假值）
+ * @returns {boolean}
+ */
+export function shouldRefreshLiveUrl(session, nowMs) {
+  if (!session || typeof session !== 'object') return false;
+  if (session.live !== true) return false;
+  const at = Number(session.liveUrlAt) || 0;
+  if (!(at > 0)) return false;
+  const now = Number(nowMs);
+  if (!isFinite(now)) return false;
+  return now - at >= LIVE_URL_REFRESH_MS;
+}
 
 /* ================= native 数值字段归一化（P0-1 防御性修复） =================
  *
@@ -216,6 +263,8 @@ export const MAX_DECODE_PIXELS = 1920 * 1080;
  * 对直播纯属浪费，还会让 native 的「直播直连」判据失效。
  * 所以直播固定 audioUrl=''，让 native 走单输入直连路径。 */
 export async function resolveLiveUrl(ctx, item) {
+  // 斗鱼（services/douyu 归一化条目，site:'douyu'，主键是 rid）：签名链与 B 站完全不同
+  if (item && item.site === 'douyu') return resolveDouyuLiveUrl(ctx, item);
   const roomid = Number(item && item.roomid) || 0;
   if (!(roomid > 0)) return { ok: false, stage: 'param', message: '直播间号无效' };
   const r = await fetchLivePlayUrl(ctx.client, roomid, {
@@ -242,7 +291,178 @@ export async function resolveLiveUrl(ctx, item) {
     width: r.width || 1280,
     height: r.height || 720,
     host: r.host || '',
-    fps: LIVE_FPS
+    fps: LIVE_FPS,
+    site: 'bili',
+    /* 这条直链是「什么时候拿到的」—— 页面轮询据此调 shouldRefreshLiveUrl()。
+     * B 站直链约 1~2h 过期，同样走这套提前换链逻辑（成本只是一次 GET）。 */
+    liveUrlAt: nowMsOf(ctx)
+  };
+}
+
+/* ===================== 斗鱼直播（doc §1/§3） =====================
+ *
+ * 与 B 站直播的差异（每一条都是真机/联网实测，不是猜测）：
+ *   - 直链 expire=**300s**（B 站 1~2h）→ 换链必须**重新签名**（getEncryption +
+ *     getH5PlayV1），改 URL 后缀/续 query 一律 403。
+ *   - 服务端**不保证**遵守请求的 rate（实测 rate=4 可能回 rate=0，rate=0 可能回
+ *     rate=4）→ 实际档位以返回值 `rate` 为准，UI 不要拿请求值显示。
+ *   - 错误语义：-15 = 房间不存在/未开播；-9 = 设备时钟偏差；403 = auth/did 不一致。
+ *   - 直链是 FLV + 音轨在同一条流里（与 B 站一致）→ 仍然 audioUrl=''。
+ *
+ * 图片/列表字段全在 services/douyu/ 下，这里只负责「房间号 → 可播放直链」。
+ * ========================================================================= */
+
+// 会话里该播哪个斗鱼码率档：页面可用 ctx.douyuRate 覆盖（doc §3：2 默认，可选 4/3/0）
+function douyuRateFor(ctx) {
+  const v = Number(ctx && ctx.douyuRate);
+  return isFinite(v) && v >= 0 ? v : DOUYU_DEFAULT_RATE;
+}
+
+// 统一取「现在」的毫秒时间戳：单测喂 ctx.nowMs，真机走 Date.now
+function nowMsOf(ctx) {
+  const n = ctx && typeof ctx.nowMs === 'function' ? Number(ctx.nowMs()) : NaN;
+  return isFinite(n) && n > 0 ? n : Date.now();
+}
+
+/* 斗鱼取流 → resolveLiveUrl 的返回形状。
+ * api.fetchPlayInfo 已经把 HTTP/业务码归一成 {ok,error,errorText}，这里再翻成
+ * 播放层统一的 {ok:false,stage,message}（页面用 describePlayError 显示一行话）。 */
+async function resolveDouyuLive(ctx, rid, rate) {
+  // 可注入：单测/诊断时用 ctx.douyuFetchPlayInfo 替身（真机走 api.fetchPlayInfo）。
+  // 与 ctx.client / ctx.player 的注入风格一致，避免单测真的打网络。
+  const fetchPlay = ctx && typeof ctx.douyuFetchPlayInfo === 'function'
+    ? ctx.douyuFetchPlayInfo
+    : douyuFetchPlayInfo;
+  const r = await fetchPlay(rid, rate);
+  if (r && r.ok) {
+    return {
+      ok: true,
+      url: r.url,
+      rate: r.rate, // 服务端**实际**给的档位
+      rates: r.rates || []
+    };
+  }
+  const code = r ? r.error : 'NETWORK';
+  // -15 = 房间不存在或未开播（实测 ol=0 的房间必得 -15）；其他都算取流失败
+  if (code === -15) {
+    return { ok: false, stage: 'offline', code: code, message: (r && r.errorText) || '主播未开播' };
+  }
+  return {
+    ok: false,
+    stage: 'playurl',
+    code: code,
+    message: (r && r.errorText) || '斗鱼取流失败'
+  };
+}
+
+/* 斗鱼直播：房间号 → {ok, live:true, url, ...} | {ok:false, stage, message}
+ * item 就是 services/douyu/normalize.js 的条目（site:'douyu', rid, title...）。 */
+async function resolveDouyuLiveUrl(ctx, item) {
+  const rid = Number(item && (item.rid || item.roomid)) || 0;
+  if (!(rid > 0)) return { ok: false, stage: 'param', message: '房间号无效' };
+  const rate = douyuRateFor(ctx);
+  const r = await resolveDouyuLive(ctx, rid, rate);
+  if (cancelled(ctx)) return { ok: false, stage: 'cancel', message: '已取消' };
+  if (!r.ok) return r;
+  return {
+    ok: true,
+    live: true,
+    url: r.url,
+    /* 斗鱼 FLV 自带音轨，与 B 站同理：回填会开第二条连接（native MAP_DUAL_IN） */
+    audioUrl: '',
+    qn: r.rate,
+    cid: rid,
+    roomid: rid,
+    aid: 0,
+    durationMs: 0,
+    title: (item && item.title) || '',
+    /* getH5PlayV1 不返回分辨率（multirates 只有 name/rate/bit）→ 按 FLV 源常见的
+     * 16:9 给默认值；信箱适配只影响上屏比例，不影响解码（native 硬缩放）。 */
+    width: 1280,
+    height: 720,
+    host: '',
+    fps: LIVE_FPS,
+    site: 'douyu',
+    liveUrlAt: nowMsOf(ctx),
+    /* 换链时要记住**请求的**档位（不是服务端回的实际档位）：续播沿用用户选的档，
+     * 服务端再次就近降/升档是它的自由。 */
+    douyuRate: rate,
+    rates: r.rates
+  };
+}
+
+/* 直播直链过期前的**主动换链**（页面轮询：shouldRefreshLiveUrl(session, now) →
+ * refreshLiveUrl(ctx, session)）。
+ *
+ * 为什么不能「改 URL 后缀」或「续 query」：斗鱼直链的 wsAuth/token/expire 都是
+ * 服务端按 (did, rid, ts, auth) 签发的，改任何一个字符都过不了 CDN 校验（实测把
+ * `_900.flv` 改成 `_4000.flv` 直接 403）。唯一合法途径是重新走一遍
+ * getEncryption → getH5PlayV1（api.fetchPlayInfo 内部就是这两步）。B 站直播同理
+ * 必须重新打 getRoomPlayInfo。
+ *
+ * 返回：
+ *   {ok:true,  url, liveUrlAt, qn?, rates?, message:''}
+ *   {ok:false, stage, message}           —— stage 与 resolveLiveUrl 同构，绝不 throw
+ *
+ * 调用方拿到新 url 后的动作（native 侧）不在本函数职责内：页面按自己的能力
+ * 选择 player.openSession 重开或把新 URL 交给 native 的换源命令。
+ *
+ * @param {object} ctx     与 openVideo 同一个 ctx（需要其中任意一个；不读屏）
+ * @param {{roomid?: number, rid?: number, site?: string, douyuRate?: number, live?: boolean}} session
+ *        openVideo() 返回的 session；`live` 必须为 true 才会取流
+ * @param {{nowMs?: number, rate?: number}} [opts] 单测可喂假 nowMs / 指定档位
+ */
+export async function refreshLiveUrl(ctx, session, opts) {
+  const o = opts || {};
+  if (!session || typeof session !== 'object') {
+    return { ok: false, stage: 'param', message: '会话不存在' };
+  }
+  if (session.live !== true) {
+    return { ok: false, stage: 'param', message: '不是直播会话' };
+  }
+  // 斗鱼的 roomid 就是 rid；B 站只有 roomid。两个字段都认，避免页面转述时丢字段。
+  const roomid = Number(session.roomid || session.rid) || 0;
+  if (!(roomid > 0)) return { ok: false, stage: 'param', message: '直播间号无效' };
+
+  // 时钟：单测喂 opts.nowMs，其次 ctx.nowMs，最后 Date.now
+  const nowMs = isFinite(Number(o.nowMs)) && Number(o.nowMs) > 0
+    ? Number(o.nowMs)
+    : nowMsOf(ctx);
+
+  if (session.site === 'douyu') {
+    const rate = isFinite(Number(o.rate)) && Number(o.rate) >= 0
+      ? Number(o.rate)
+      : (isFinite(Number(session.douyuRate)) && Number(session.douyuRate) >= 0
+        ? Number(session.douyuRate)
+        : DOUYU_DEFAULT_RATE);
+    const r = await resolveDouyuLive(ctx, roomid, rate);
+    if (cancelled(ctx)) return { ok: false, stage: 'cancel', message: '已取消' };
+    if (!r.ok) return r;
+    return {
+      ok: true,
+      url: r.url,
+      liveUrlAt: nowMs,
+      qn: r.rate,
+      rates: r.rates || [],
+      douyuRate: rate,
+      message: ''
+    };
+  }
+
+  // B 站直播：重新打 getRoomPlayInfo（fetchLivePlayUrl 不带缓存，天然是重新签名）
+  const r = await fetchLivePlayUrl(ctx.client, roomid, {
+    log: ctx.log,
+    qn: liveQnFor(ctx.videoSettings)
+  });
+  if (cancelled(ctx)) return { ok: false, stage: 'cancel', message: '已取消' };
+  if (!r.ok) return r;
+  return {
+    ok: true,
+    url: r.url,
+    liveUrlAt: nowMs,
+    qn: r.qn,
+    rates: [],
+    message: ''
   };
 }
 
@@ -286,8 +506,9 @@ function cancelled(ctx) {
 
 // → {ok, url, audioUrl, qn, cid, durationMs, title, width, height, host} | {ok:false, stage, message}
 export async function resolveVideoUrl(ctx, item) {
-  // 直播（search kind=live）：不走 bvid/view/playurl 链，直接构造服务端点播地址
-  if (item && item.kind === 'live') return resolveLiveUrl(ctx, item);
+  // 直播（search kind=live，B 站）：不走 bvid/view/playurl 链，直接构造服务端点播地址
+  // 斗鱼条目不设 kind（feed 层统一形状），用 site 判别 —— 两者都并入直播链
+  if (item && (item.kind === 'live' || item.site === 'douyu')) return resolveLiveUrl(ctx, item);
   if (!item || !/^BV[0-9A-Za-z]{10}$/.test(item.bvid || '')) {
     return { ok: false, stage: 'param', message: '稿件标识不合法' };
   }
@@ -505,7 +726,14 @@ export async function openVideo(ctx, item) {
        * build_pipeline 与 PB2_CMD_SET_RECT 里都会统一加 PB2_PANEL_X_OFFSET(107)。
        * 所以这里原样回传给 setVideoRect 即可，不要在 JS 侧再加偏移（加了会变 214）。
        * 真机实测：orig.x=0 → 管线里 render-rectangle 是 <107,299,240,427>。 */
-      rectPhysical: rects.physical
+      rectPhysical: rects.physical,
+      /* 直播换链：页面轮询用 shouldRefreshLiveUrl(session, now) 判定、refreshLiveUrl()
+       * 取新链。liveUrlAt 是这条直链的取得时刻（点播恒为 0，因为不需要换链）。
+       * douyuRate 是**请求的**斗鱼档位（换链沿用），rates 供「码率」菜单展示。 */
+      liveUrlAt: rs.live ? (rs.liveUrlAt || 0) : 0,
+      site: rs.site || 'bili',
+      douyuRate: rs.douyuRate,
+      rates: rs.rates || []
     }
   };
 }

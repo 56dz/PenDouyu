@@ -1,13 +1,16 @@
-// PenBili 主题变量（B站风格 · X6 Pro 逻辑画布 960x266）
+// PenDouyu 主题变量（斗鱼风格 · X6 Pro 逻辑画布 960x266）
 // 变量名保持旧名兼容（base.less / 各页面只认这些名字），只换色值。
+// 历史说明：本工程 Fork 自 PenBili（B 站版），原先主色是 B 站粉 #FB7299 /
+// B 站蓝 #00AEEC。改造为斗鱼直播后统一换成斗鱼橙 #FF5D23 与浅橙 #FF8A50，
+// 变量名没改（@accent / @accent-blue / @accent-dim），只是为了不牵动 30+ 处引用。
 @background-color: #0F1114;      // 页面底色（深空黑）
 @card-background-color: #1A1D23; // 卡片
 @card-border-color: #2A2F38;     // 描边 / 图片占位灰
 @text-color: #E9ECF0;
 @text-color-dim: #8A929E;
-@accent: #FB7299;                // B站粉（主色）
-@accent-blue: #00AEEC;           // B站蓝（辅助强调）
-@accent-dim: #FB7299;            // 旧名：主按钮/选中态底色 → 直接用品牌粉
+@accent: #FF5D23;                // 斗鱼橙（主色）
+@accent-blue: #FF8A50;           // 斗鱼浅橙（辅助强调；变量名沿用旧名）
+@accent-dim: #FF5D23;            // 旧名：主按钮/选中态底色 → 直接用斗鱼橙
 @danger: #FF6B6B;
 @progress-track: #2A2F38;
 @nav-background: #15181D;        // 顶栏 / 分区栏

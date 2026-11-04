@@ -64,7 +64,7 @@ typedef enum {
      * 用户看到「画面冻住、点哪里都没反应，只能返回列表重进」。
      *
      * 现在 native 提供真正的自愈入口：
-     *   - 直播 → live_rebuild_pipeline("recover")（重拉 souphttpsrc）
+     *   - 直播 → live_rebuild_pipeline("recover")（重开 curl + 重建管线）
      *   - 点播 → 以当前位置投递一次原地 seek（与旧 JS 行为一致，但少一次往返）
      */
     PB2_CMD_RECOVER = 12,

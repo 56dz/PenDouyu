@@ -86,6 +86,12 @@ typedef struct {
     long long baseMs;             /* ffmpeg -ss 的基准（对 JS 报告位置要加它） */
     int is_http;
     int dual;                     /* 1 = 双 FIFO 双 demux 模式 */
+    /*
+     * 1 = 直播源（pb2_src_open_live 起的 curl 写 FIFO）。
+     * 只影响回收策略：直播必须 SIGKILL（curl 收到 SIGTERM 会先把缓冲写完才退，
+     * 直播没有结尾可写，只会白等一个宽限窗口），点播的 ffmpeg 仍走 SIGTERM。
+     */
+    int is_live;
     int active;
 } pb2_src_t;
 
@@ -102,9 +108,41 @@ int pb2_src_open(pb2_src_t *s, const char *input, const char *input2, const char
                  const char *ref, long long baseMs, long long durationMs);
 
 /*
+ * 直播源：建 FIFO + fork 设备自带的 /bin/curl 写进去，GStreamer 侧只用
+ * filesrc 读（session 拼 `filesrc ... ! flvdemux`）。
+ *
+ * ============ 为什么直播不用 ffmpeg，也不用 souphttpsrc ============
+ * 1) souphttpsrc 拉斗鱼 CDN 必定失败，实测错误是
+ *    `Server does not accept Range HTTP header`，is-live / iradio-mode
+ *    各种组合都试过无效（GstBaseSrc push 模式仍会发 Range）。
+ * 2) ffmpeg 没必要：直播要的是「原样字节流灌进 flvdemux」，不需要转容器，
+ *    也不需要 -ss 定位（直播不可 seek）。ffmpeg 只会多一层延迟和一处
+ *    可能自己改时间戳的地方。
+ * 3) 设备上的 curl 是唯一实测能稳定拉斗鱼 FLV 直链的东西。
+ *    注意 **stdout 管道是坏的**：`curl URL | cat` 得 0 字节、
+ *    `curl -v | cat` 报 `curl: (3) Error`；而 `curl -s URL -o <file>`
+ *    与 `curl -s URL -o <fifo>` 都正常（427KB）。所以 **必须用 -o <fifo>
+ *    传参**，绝不能靠 stdout 重定向/管道。
+ *
+ * 参数与真机验证过的命令保持一致（详见 docs/douyu-integration.md 第 4 节）：
+ *   /bin/curl -s -L --connect-timeout 8 --speed-limit 1024 --speed-time 20
+ *             -o <fifo> -A <ua> -e <referer> [-H "Origin: ..."] <url>
+ * --speed-limit/--speed-time 让「CDN 掐流但连接不断」能在 20 秒内自己退出，
+ * 上层的存活探测/重连才有事件可依。
+ *
+ * 返回 0 成功（s->location 为 FIFO 路径、s->is_live=1、s->active=1），-1 失败。
+ */
+int pb2_src_open_live(pb2_src_t *s, const char *url, const char *ua, const char *ref);
+
+/*
  * 关闭媒体源：并行 SIGTERM 两个 ffmpeg（reap_pair，宽限 PB2_REAP_GRACE_MS 后
  * SIGKILL）、关 hold_fd/hold_fd2、删 FIFO。不是串行 kill+wait —— 串行回收
  * 曾吃掉约 500ms 的 seek 关键路径（P1-3）。
+ *
+ * 直播源（s->is_live=1，进程是 curl）走直接 SIGKILL：curl 收到 SIGTERM 会
+ * 先把缓冲数据写完再退，而直播没有结尾、也没人再读 FIFO，SIGTERM 只会白等
+ * 一个宽限窗口。点播的 ffmpeg 仍按 SIGTERM 起步（需要机会 flush 结尾）。
+ *
  * 幂等，可重复调用。
  */
 void pb2_src_close(pb2_src_t *s);
