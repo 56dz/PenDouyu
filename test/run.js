@@ -11,6 +11,20 @@ let passed = 0;
 let failed = 0;
 const pending = [];
 
+// 异步用例是**并发**跑的（都塞进 pending）。凡是会改写 globalThis.$falcon 的用例
+// 必须串行，否则后注册的用例会在前者 await 期间覆盖/删掉 shim —— 症状是
+// 「Cannot read properties of undefined (reading 'method')」这类莫名失败。
+// 用法：test('...', () => withFalcon(async () => { ... }));
+let falconChain = Promise.resolve();
+function withFalcon(fn) {
+  const run = falconChain.then(fn, fn);
+  falconChain = run.then(
+    () => {},
+    () => {}
+  );
+  return run;
+}
+
 function test(name, fn) {
   const ok = () => {
     passed++;
@@ -49,7 +63,7 @@ function test(name, fn) {
 async function main() {
 
   const { md5Hex } = await import('../src/services/md5.js');
-  const { unwrapResponse, tryParseJson, toRuntimeHeader, httpGet } = await import('../src/services/net.js');
+  const { unwrapResponse, tryParseJson, toRuntimeHeader, httpGet, httpPost, httpRequest } = await import('../src/services/net.js');
   const {
     buildOpenArgs,
     isSafeInput,
@@ -73,6 +87,7 @@ async function main() {
     BAR_WIDTH,
     GRID_COLS,
     trimToGridRows,
+    trimGridSafe,
     KEEP_INTERVAL_MS,
     createScreenKeeper,
     keepScreenOnce,
@@ -228,9 +243,53 @@ async function main() {
     assert.strictEqual(toRuntimeHeader(null), null);
   });
 
-  test('net: 无 $falcon 时 httpGet 以 NET_UNAVAILABLE 拒绝', async () => {
-    await assert.rejects(() => httpGet('https://x/'), /NET_UNAVAILABLE/);
-  });
+  test('net: 无 $falcon 时 httpGet 以 NET_UNAVAILABLE 拒绝', () =>
+    withFalcon(async () => {
+      // 串行链上的第一条：此时还没有任何用例装过 shim。
+      assert.strictEqual(globalThis.$falcon, undefined, '前面不该遗留 shim');
+      await assert.rejects(() => httpGet('https://x/'), /NET_UNAVAILABLE/);
+    }));
+
+  test('net: httpPost 走 POST 且不带请求体（取流必需）', () =>
+    withFalcon(async () => {
+      const seen = [];
+      globalThis.$falcon = {
+        jsapi: {
+          http: {
+            request(options, cb) {
+              seen.push(options);
+              const res = { result: '{"ok":1}' };
+              if (typeof cb === 'function') cb(res, null);
+              return Promise.resolve(res);
+            }
+          }
+        }
+      };
+      try {
+        // POST：method 必须传 'POST'，且 **options 里不能有 data/body**
+        // （runtime 会把 options.data 再做一次 JSON 序列化，服务端会 400）
+        const r1 = await httpPost('https://www.douyu.com/lapi/live/getH5PlayV1/9?rate=2', {
+          headers: { Referer: 'https://www.douyu.com/' }
+        });
+        assert.strictEqual(r1.statusCode, 200);
+        assert.strictEqual(r1.body, '{"ok":1}');
+        assert.strictEqual(seen[0].method, 'POST', '取流必须 POST');
+        assert.strictEqual(seen[0].data, undefined, 'POST 也不发请求体');
+        assert.strictEqual(seen[0].body, undefined, 'POST 也不发请求体');
+        assert.strictEqual(seen[0].header.Referer, 'https://www.douyu.com/');
+        assert.ok(seen[0].url.indexOf('rate=2') > 0, '参数全在 query 上');
+        // GET 薄封装：method 固定 'GET'
+        await httpGet('https://www.douyu.com/gapi/rkc/directory/mixList/0_0/1');
+        assert.strictEqual(seen[1].method, 'GET');
+        // httpRequest 默认 GET，显式传小写也会被归一成大写
+        await httpRequest('https://x/');
+        assert.strictEqual(seen[2].method, 'GET');
+        await httpRequest('https://x/', { method: 'post' });
+        assert.strictEqual(seen[3].method, 'POST', 'method 大小写不敏感');
+      } finally {
+        delete globalThis.$falcon;
+      }
+    }));
 
   // ---------------- player adapter ----------------
 
@@ -651,7 +710,67 @@ async function main() {
     assert.deepStrictEqual(douyuApi.normalizeRates('x'), []);
   });
 
-  test('douyu/normalize: 条目归一（封面/头像档位、人气文案、未开播标记）', () => {
+  test('douyu/api: fetchPlayInfo 走 POST 取流，其它端点仍 GET', () =>
+    withFalcon(async () => {
+      // 真机根因：getH5PlayV1 用 GET 只有 17.5% 成功（240 间实测），
+      // 失败形态是 HTTP 200 + error:-15，与「房间不存在」无法区分 →
+      // 表现成「主页大量房间未开播」。所以这里钉死「取流必须 POST」。
+      const seen = [];
+      const enc = { key: 'K'.repeat(26), rand_str: 'r'.repeat(16), enc_time: 1, enc_data: 'E'.repeat(64), expire_at: 0 };
+      globalThis.$falcon = {
+        jsapi: {
+          http: {
+            request(options, cb) {
+              const u = String(options.url || '');
+              seen.push({ method: options.method, url: u, hasData: options.data !== undefined, hasBody: options.body !== undefined });
+              let body;
+              if (u.indexOf('/websec/getEncryption') >= 0) {
+                // expire_at 给 0 → isEncFresh 走「保守 2 分钟」分支，本例只请求一次
+                body = JSON.stringify({ error: 0, msg: 'ok', data: enc });
+              } else if (u.indexOf('/getH5PlayV1/') >= 0) {
+                body = JSON.stringify({
+                  error: 0,
+                  msg: 'ok',
+                  data: {
+                    rtmp_url: 'https://hwa.douyucdn2.cn/live',
+                    rtmp_live: '36252abc_900.flv?wsAuth=x&expire=0',
+                    rate: 2,
+                    multirates: [{ name: '高清', rate: 2, bit: 900, diamondFan: 1 }]
+                  }
+                });
+              } else {
+                body = '{"error":0}';
+              }
+              const res = { result: body };
+              if (typeof cb === 'function') cb(res, null);
+              return Promise.resolve(res);
+            }
+          }
+        }
+      };
+      try {
+        douyuApi.clearEncryptionCache();
+        const r = await douyuApi.fetchPlayInfo(36252, 2);
+        assert.strictEqual(r.ok, true, '取流应成功');
+        assert.strictEqual(r.url, 'https://hwa.douyucdn2.cn/live/36252abc_900.flv?wsAuth=x&expire=0', 'rtmp_url + "/" + rtmp_live');
+        assert.strictEqual(r.rate, 2, '返回服务端实际档位');
+        assert.strictEqual(r.rates.length, 1);
+        // 两次请求：getEncryption(GET) → getH5PlayV1(POST)
+        assert.strictEqual(seen.length, 2, '取流应只打两个端点');
+        assert.strictEqual(seen[0].method, 'GET', 'getEncryption 保持 GET');
+        assert.ok(seen[0].url.indexOf('/websec/getEncryption') > 0);
+        assert.strictEqual(seen[1].method, 'POST', '**取流必须 POST**（GET 只有 17.5% 成功率）');
+        assert.ok(seen[1].url.indexOf('/getH5PlayV1/36252') > 0);
+        assert.ok(seen[1].url.indexOf('rate=2') > 0, 'POST 的参数也全在 query 上');
+        assert.strictEqual(seen[1].hasData, false, '不发请求体（runtime 会二次序列化）');
+        assert.strictEqual(seen[1].hasBody, false, '不发请求体');
+      } finally {
+        delete globalThis.$falcon;
+        douyuApi.clearEncryptionCache();
+      }
+    }));
+
+  test('douyu/normalize: 条目归一（封面/头像档位、人气文案、重播标记）', () => {
     const raw = {
       rid: 1863767,
       rn: '  王者荣耀  官方赛事 ',
@@ -659,6 +778,7 @@ async function main() {
       cid2: 181,
       c2name: '王者荣耀',
       ol: 536100,
+      rst: 0,
       av: 'avatar_v3/202507/abc',
       rs16: 'https://rpic.douyucdn.cn/live-cover/roomCover/2025/08/01/x.jpg',
       rs1: 'https://rpic.douyucdn.cn/live-cover/roomCover/2025/08/01/x_big.jpg'
@@ -673,6 +793,7 @@ async function main() {
     assert.strictEqual(it.onlineText, '53.6万');
     assert.strictEqual(it.isLive, true, '契约恒为 true');
     assert.strictEqual(it.offline, false);
+    assert.strictEqual(it.loop, false, 'rst=0 → 正常直播');
     // 默认 rs16；显式 rs1 才用大图（400x400 方形，布局不能按 16:9 摆）
     assert.ok(it.cover.indexOf('/x.jpg') > 0, '默认 rs16：' + it.cover);
     assert.ok(douyuNorm.normalizeRoom(raw, { size: 'rs1' }).cover.indexOf('/x_big.jpg') > 0);
@@ -682,7 +803,11 @@ async function main() {
     assert.strictEqual(it.avatar, 'http://apic.douyucdn.cn/upload/avatar_v3/202507/abc_middle.jpg');
     assert.ok(douyuNorm.normalizeAvatar('avatar_v3/x', 'big').indexOf('_big.jpg') > 0);
     assert.strictEqual(douyuNorm.normalizeAvatar(''), '');
-    // 未开播：ol=0（实测这类房间取流必得 -15）
+    // 重播角标只看 rst===3（实测 40 样本 TP=5/TN=35/FP=0/FN=0，零额外请求）
+    assert.strictEqual(douyuNorm.normalizeRoom({ rid: 3, rn: 't', nn: 'n', rst: 3 }).loop, true, 'rst=3 → 重播');
+    assert.strictEqual(douyuNorm.normalizeRoom({ rid: 3, rn: 't', nn: 'n' }).loop, false, 'rst 缺失 → 非重播');
+    assert.strictEqual(douyuNorm.normalizeRoom({ rid: 3, rn: 't', nn: 'n', rst: '3' }).loop, false, '字符串不算');
+    // ol=0 仍保留 offline 标记（仅供参考），但**不得**据此剔房间：ol=0 的房里也有人能播
     const off = douyuNorm.normalizeRoom({ rid: 2, rn: 't', nn: 'n', ol: 0 });
     assert.strictEqual(off.offline, true);
     assert.strictEqual(off.onlineText, '');
@@ -1346,6 +1471,24 @@ async function main() {
   });
 
   // ---------------- 主页网格：加载更多后必须整行（用户要求 m11950-3）----------------
+
+  test('screen: trimGridSafe 不足一行不裁（搜索/小分区不会被裁空）', () => {
+    // 斗鱼搜 lol 全站常只命中 1 间 → 直接 trimToGridRows 会裁成 0，界面显示「没有搜到」
+    assert.deepStrictEqual(trimGridSafe([1], GRID_COLS), { items: [1], trimmed: 0 });
+    assert.deepStrictEqual(trimGridSafe([1, 2, 3], GRID_COLS), { items: [1, 2, 3], trimmed: 0 });
+    // 正好一行不裁
+    const one = [1, 2, 3, 4, 5];
+    assert.deepStrictEqual(trimGridSafe(one, GRID_COLS), { items: one, trimmed: 0 });
+    // 超过一行才裁末行
+    assert.deepStrictEqual(trimGridSafe([1, 2, 3, 4, 5, 6, 7], GRID_COLS), {
+      items: [1, 2, 3, 4, 5],
+      trimmed: 2
+    });
+    assert.deepStrictEqual(trimGridSafe([], GRID_COLS), { items: [], trimmed: 0 });
+    assert.deepStrictEqual(trimGridSafe(null, GRID_COLS), { items: [], trimmed: 0 });
+    // cols 传 0/脏值按 GRID_COLS 兜底，不应把 5 条裁光
+    assert.strictEqual(trimGridSafe([1, 2, 3, 4, 5], 0).items.length, 5);
+  });
 
   test('screen: trimToGridRows 尾部裁到列数整数倍', () => {
     assert.strictEqual(GRID_COLS, 5);

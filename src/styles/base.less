@@ -436,6 +436,20 @@
   lines: 1;
 }
 
+/* 重播角标：与 .dy-live 同盒子（32x12）只换配色 —— 重播和直播中互斥，
+   共用同一个槽位，布局预算零变化。灰蓝底是为了在橙色「直播中」旁边
+   一眼区分开：橙色代表此刻有实时信号，灰色代表是录像轮播。 */
+.dy-loop {
+  width: 32px;
+  height: 12px;
+  border-radius: 2px;
+  background-color: @ctrl-background;
+  color: @text-color-dim;
+  font-size: 8px;
+  text-align: center;
+  lines: 1;
+}
+
 .dy-hot {
   width: 60px;
   height: 12px;

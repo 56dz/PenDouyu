@@ -35,8 +35,8 @@
              + 14 主播 + 72 简介 + 16 提示 + 上下留白），随便加一行就会把末尾的
              .pnote（重连中/加载中提示）挤出可视区。 -->
         <div class="pdesc dy-meta">
-          <text class="dy-meta-row">热度 {{ dyOnlineText || '—' }}</text>
-          <text class="dy-meta-row">已播 {{ liveElapsedText }}</text>
+          <text class="dy-meta-row">{{ dyOnlineRow }}</text>
+          <text class="dy-meta-row">{{ dyElapsedRow }}</text>
           <text class="dy-meta-row">当前 {{ dyRateLabel }}</text>
         </div>
         <!-- 播放提示（「加载中…」「直播重连中…」等）。
@@ -106,7 +106,8 @@
             <div class="dy-cell">
               <image class="thumb" :src="it.cover" :width="166" :height="93"></image>
               <div class="dy-tagrow">
-                <text class="dy-live">直播中</text>
+                <text v-if="it.loop" class="dy-loop">重播</text>
+                <text v-else class="dy-live">直播中</text>
                 <div class="dy-tagspacer"></div>
                 <text class="dy-hot">{{ it.onlineText }}</text>
               </div>
@@ -178,7 +179,7 @@
 </template>
 
 <script>
-import { GRID_COLS, trimToGridRows, KEEP_INTERVAL_MS, keepScreenOn, keepScreenOff, keepScreenBackend, keepScreenTicks, isKeepingScreen, getScreenState } from '../../services/screen.js';
+import { GRID_COLS, trimGridSafe, KEEP_INTERVAL_MS, keepScreenOn, keepScreenOff, keepScreenBackend, keepScreenTicks, isKeepingScreen, getScreenState } from '../../services/screen.js';
 /* 图标：assets/icons/ 下只剩 logo（左栏 30x30）与 back（播放页返回 22x22）。
  * 纯斗鱼版没有点赞投币、没有评论区、没有图文，其余 14 个图标文件已随 B 站一起删除。
  * logo 由 tools/make_douyu_icon.py 从斗鱼官方鲨鱼图生成，与 app_icon.png 同源。 */
@@ -406,6 +407,27 @@ export default {
        * 否则左列会闪一下空白。 */
       return formatDuration(this.dyElapsedSec || 0) || '00:00';
     },
+    /* 左列第一行文案：直播显示「热度 12.3万」，重播显示「录像轮播」。
+     * 为什么不用模板里拼串：falcon 模板对表达式支持有限，拼接容易踩坑，
+     * 统一在 computed 里算好，模板只做一次取值。 */
+    dyOnlineRow() {
+      if (this.isLoopPlay) return '录像轮播';
+      return '热度 ' + (this.dyOnlineText || '—');
+    },
+    /* 左列第二行：直播是「已播 01:23」（本机会话时长），重播是「轮播中」
+     * （重播的"已播"没意义 —— 那是录像本身的进度，与本机会话无关）。 */
+    dyElapsedRow() {
+      if (this.isLoopPlay) return '轮播中';
+      return '已播 ' + this.liveElapsedText;
+    },
+    /* 当前会话是不是录像轮播（重播）。
+     * 判据就是 session.loop（源自列表 rst===3，见 douyu/normalize.js）。
+     * 用途：播放页左上角把「热度」那行让给「重播」提示 —— 重播的热度是历史值，
+     * 显示出来会骗人。 */
+    isLoopPlay() {
+      const s = this.play.session;
+      return !!(s && s.loop === true);
+    },
     // 当前实际码率档位：服务端会就近取档（请求 0 可能给 4），必须回显 session.qn
     dyRateLabel() {
       const s = this.play.session;
@@ -617,7 +639,8 @@ export default {
         const items = Array.isArray(r.items) ? r.items : [];
         // 尾部裁到列数整数倍（末行不满会露出半行残缺卡片）
         const merged = replace ? items : this.dyItems.concat(items);
-        const cut = trimToGridRows(merged, GRID_COLS);
+        // 不足一行的小分类（实测有只挂 1~3 间房的分区）不能裁，否则整页空白
+        const cut = trimGridSafe(merged, GRID_COLS);
         this.dyItems = cut.items;
         this.dyPage = page;
         this.dyTotal = r.total || 0;
@@ -702,8 +725,10 @@ export default {
           return;
         }
         const raw = Array.isArray(r.items) ? r.items : [];
-        // 尾部裁到列数整数倍（与网格同一条规则：末行不满会露出半行残缺卡片）
-        const cut = trimToGridRows(raw, GRID_COLS);
+        /* 搜索结果不能照搬浏览列表的裁行规则：斗鱼的「标题直接命中」本来就很少
+         * （搜 lol 全站常常只命中 1~2 间），一裁就归零，界面显示「没有搜到」而
+         * 实际有结果 —— 实测踩到的真 bug。 */
+        const cut = trimGridSafe(raw, GRID_COLS);
         this.dySearchItems = cut.items;
         /* via='cate' 是服务层的语义：关键词命中了分类，但该分类里没人把关键词写进
          * 标题/主播名 → 返回的是「这个分类的全部直播」。必须明说，否则用户会以为
@@ -777,6 +802,10 @@ export default {
           desc: '',
           cover: it.cover || '',
           durationMs: 0,
+          /* loop 现在就要带上：这是「乐观会话」，从点进来到 openVideo 返回之间
+           * （1~2 秒）模板已经在渲染左列了。不在这里写死，重播房间会先闪一下
+           * 「热度 ...」再变成「录像轮播」，观感像卡了一下。 */
+          loop: it.loop === true,
           qn: 0
         },
         positionMs: 0,

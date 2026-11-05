@@ -4,12 +4,12 @@
 //   - 成功 {result:<body>}（无 statusCode）；非 2xx {error:3,result:{errorMessage:'curl ... resCode:N'}}
 //     → 非 2xx 时 body 不可得，错误文本就是全部信息
 //   - 响应头永远不可见
-// 本项目只需要带自定义头的 GET JSON（斗鱼接口必须自带浏览器 UA 过风控，见 douyu/api.js）。
+// 本项目只需要带自定义头的 GET / POST JSON（斗鱼接口必须自带浏览器 UA 过风控，见 douyu/api.js）。
 //
-// 纯斗鱼版本只保留这 5 个导出：httpGet / unwrapResponse / tryParseJson /
-// toRuntimeHeader / normalizeError。v1.x 的 native form POST（startPost/takeResult）、
-// 二进制 GET（弹幕 protobuf）与 native 文本 GET 全部随 B 站功能一起删除 —— 斗鱼所有接口
-// 都是普通 GET，jsapi.http 足够。
+// 纯斗鱼版本只保留这 7 个导出：httpRequest / httpGet / httpPost / unwrapResponse /
+// tryParseJson / toRuntimeHeader / normalizeError。v1.x 的 native form POST（startPost/takeResult）、
+// 二进制 GET（弹幕 protobuf）与 native 文本 GET 全部随 B 站功能一起删除 ——
+// jsapi.http 自己就能发 POST（只要不发请求体），不需要 native 模块。
 
 function httpApi() {
   const f = typeof $falcon !== 'undefined' ? $falcon : null;
@@ -87,9 +87,19 @@ export function toRuntimeHeader(headers) {
   return n > 0 ? out : null;
 }
 
-// GET 文本；返回 { statusCode, body(string), errorMessage }
-// opts: { headers?: Object, timeout?: number }
-export function httpGet(url, opts) {
+// 通用文本请求；返回 { statusCode, body(string), errorMessage }
+// opts: { method?: 'GET'|'POST', headers?: Object, timeout?: number }
+//
+// **不发请求体**：options 里刻意不带 data / body 字段。
+// 原因（真机踩过的坑）：runtime 会对 options.data 再做一次 JSON 序列化，
+// 传对象进去会被序列化成 '"{\"a\":1}"' 这种双重编码的字符串，服务端直接 400。
+// 斗鱼取流接口需要的是 POST + 参数全在 URL query + 空 body —— 正好不需要 body。
+//
+// 为什么取流必须 POST（240 间房实测，2026-11）：
+//   GET  成功 42/240（17.5%），POST 成功 240/240（100%）；
+//   再用 POST-first 顺序复测 30 间排除时序/限流混淆 → POST 30/30、GET 12/30。
+//   所以在改成 POST 之前，「83% 的房间看起来未开播」其实是我方误判。
+export function httpRequest(url, opts) {
   return new Promise((resolve, reject) => {
     const api = httpApi();
     if (!api) {
@@ -97,6 +107,7 @@ export function httpGet(url, opts) {
       return;
     }
     const o = opts || {};
+    const method = typeof o.method === 'string' && o.method ? o.method.toUpperCase() : 'GET';
     let settled = false;
     let guard = 0;
     const limit = o.timeout || 15000;
@@ -108,7 +119,7 @@ export function httpGet(url, opts) {
       else resolve(arg);
     };
     try {
-      const options = { url: url, method: 'GET', timeout: limit };
+      const options = { url: url, method: method, timeout: limit };
       const header = toRuntimeHeader(o.headers);
       if (header) options.header = header;
       const ret = api.request(options, (res, err) => {
@@ -127,6 +138,20 @@ export function httpGet(url, opts) {
     }
     guard = setTimeout(() => done(true, new Error('NET_TIMEOUT: 请求超时(' + limit + 'ms)')), limit + 500);
   });
+}
+
+// GET 文本（薄封装，现有调用方签名不变）
+// opts: { headers?: Object, timeout?: number }
+export function httpGet(url, opts) {
+  const o = opts || {};
+  return httpRequest(url, { method: 'GET', headers: o.headers, timeout: o.timeout });
+}
+
+// POST 文本（薄封装，**无请求体**，参数仍需全部放在 URL query 上）
+// 见 httpRequest 上方注释：斗鱼的 getH5PlayV1 必须 POST，但参数走 query + 空 body 即可。
+export function httpPost(url, opts) {
+  const o = opts || {};
+  return httpRequest(url, { method: 'POST', headers: o.headers, timeout: o.timeout });
 }
 
 // logWarn 目前未被本文件使用，但保留导入会触发打包器告警，故不导入。

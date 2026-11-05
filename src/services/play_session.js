@@ -220,7 +220,9 @@ export async function resolveLiveUrl(ctx, item) {
  *     getH5PlayV1），改 URL 后缀/续 query 一律 403。
  *   - 服务端**不保证**遵守请求的 rate（实测 rate=4 可能回 rate=0，rate=0 可能回
  *     rate=4）→ 实际档位以返回值 `rate` 为准，UI 不要拿请求值显示。
- *   - 错误语义：-15 = 房间不存在/未开播；-9 = 设备时钟偏差；403 = auth/did 不一致。
+ *   - 错误语义（取流走 POST 后）：-5 = 未开播、-3 = 房间不存在、-4 = 被封禁、
+ *     -9 = 设备时钟偏差、403 = auth/did 不一致（-15 是 GET 时代的万能码，
+ *     改 POST 前它把 83% 的正常房间也拒了，详见 douyu/api.js 文件头 A/C）。
  *   - 直链是 FLV + 音轨在同一条流里 → 仍然 audioUrl=''。
  *
  * 图片/列表字段全在 services/douyu/ 下，这里只负责「房间号 → 可播放直链」。
@@ -257,8 +259,11 @@ async function resolveDouyuLive(ctx, rid, rate) {
     };
   }
   const code = r ? r.error : 'NETWORK';
-  // -15 = 房间不存在或未开播（实测 ol=0 的房间必得 -15）；其他都算取流失败
-  if (code === -15) {
+  // 取流改 POST 后服务端能给出真正的成因（见 douyu/api.js 文件头 C）：
+  //   -5 房间未开播 / -3 房间不存在 / -4 房间被封禁 / -15 GET 时代的万能错误码。
+  // 这几种对播放侧都是「这间房现在播不了」，统一归到 stage:'offline'，
+  // 但 message 原样带出服务端文案，UI 能显示得比「主播未开播」更准。
+  if (code === -5 || code === -3 || code === -4 || code === -15) {
     return { ok: false, stage: 'offline', code: code, message: (r && r.errorText) || '主播未开播' };
   }
   return {
@@ -426,6 +431,12 @@ export async function openVideo(ctx, item) {
       cover: item.cover || '',
       /* qn = 服务端**实际**给的斗鱼档位（可能不等于请求值，见 douyu/api.js） */
       qn: rs.qn,
+      /* loop = 该房间当前播的是录像轮播而不是实时信号。
+       * 判据来自列表接口自带的 rst 字段（normalizeRoom 已归一成布尔 loop，
+       * 实测 40 样本 TP=5 TN=35 FP=0 FN=0，见 docs/douyu-integration.md）。
+       * 播放页用它把左上角状态从「直播中」换成「重播」——
+       * 用户看不出重播会以为是直播卡了。 */
+      loop: item.loop === true,
       durationMs: 0,
       outWidth: openRes.outWidth,
       outHeight: openRes.outHeight,
@@ -607,7 +618,7 @@ export async function closeSession(ctx) {
 export function describePlayError(res) {
   if (!res || res.ok) return '';
   if (res.stage === 'cancel') return '';
-  // 直播未开播：接口明确给了 -15（房间不存在/未开播），直接给用户一行话
+  // 房间播不了（-5 未开播 / -3 不存在 / -4 封禁）：直接给用户一行话
   if (res.stage === 'offline') return res.message || '主播未开播';
   const stageText = {
     param: '参数错误',

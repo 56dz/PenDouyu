@@ -16,17 +16,32 @@ GET https://www.douyu.com/wgapi/livenc/liveweb/websec/getEncryption?did={32位he
 f = rand_str
 循环 enc_time 次: f = md5(f + key)
 auth = md5(f + key + String(rid) + String(ts))     // ts = 秒级
-GET https://www.douyu.com/lapi/live/getH5PlayV1/{rid}?enc_data=..&tt=..&did=..&auth=..
-    &cdn=&rate={rate}&ver=Douyu_224011102&iar=0&ive=0&prev=1&bs=2
+POST https://www.douyu.com/lapi/live/getH5PlayV1/{rid}?enc_data=..&tt=..&did=..&auth=..
+     &cdn=&rate={rate}&ver=Douyu_224011102&iar=0&ive=0&prev=1&bs=2
   -> error=0 时 data.rtmp_url + '/' + data.rtmp_live = 可直接 curl 的 FLV 直链
      data.multirates = [{name, rate, bit}]
 ```
+
+> ⚠️ **取流必须是 POST**（2026-11 修正，此前本节写的是 GET，那是错的）。
+> 240 间房实测：GET 成功 42/240（**17.5%**），POST 成功 240/240（**100%**）；
+> 再用 POST-first 顺序复测 30 间排除「先发者吃亏」的时序解释 → POST 30/30、GET 12/30。
+> GET 失败时服务端返回 HTTP 200 + `error:-15`「非法请求」，与「房间不存在」长得一模一样，
+> 所以在改 POST 之前，主页上约 83% 的房间被误判成「未开播」。
+>
+> **不需要发请求体**：参数全部放 URL query、POST 带空 body 实测 20/20 成功。
+> 这一点很关键——它意味着不用为了 POST 恢复 native 模块。运行时 `$falcon.jsapi.http`
+> 会对 `options.data` 做二次 JSON 序列化（这正是当年 `libjsapi_httpjson.so` 存在的理由），
+> 而我们根本不传 data，就绕开了这个坑。实测带任何 body 都会挂：
+> body 放 JSON 串 → 全 `-1`；`Content-Type: application/json` + `{}` → 全 `-9`。
+
 硬性要求：
 - `ver` 必须是 `Douyu_224011102`（用 `Douyu_new` 会返回纯文本「鉴权失败」）。
 - form/query 里必须带 `did`，且与 getEncryption 用的是同一个。
 - `iar=0` 才会遵守 `rate`；`iar=1` 恒给最高档。
 - 每个码率档必须**单独签名请求一次**；直接改 URL 里的 `_4000` 后缀会 403。
 - 直链 `expire=300` 秒，播放时必须在拿到后立刻用，重连要重新签名。
+- **GET 和 POST 都要带同一套 UA/Referer/Origin**，且必须与该站一致（拿 B 站 Referer 拉
+  斗鱼 CDN 会被拒——这是 v1.0.0 的真实 bug）。
 - 请求头：`User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) ... Chrome/120`，
   `Referer: https://www.douyu.com/`，`Origin: https://www.douyu.com`。
 
@@ -53,13 +68,16 @@ export async function searchLive(keyword)              // -> {items, via:'direct
 
 // 统一条目结构（browse 网格直接消费）
 // { site:'douyu', rid:Number, title:String, streamer:String, cover:String,
-//   avatar:String, category:String, online:Number, onlineText:String, isLive:true }
+//   avatar:String, category:String, online:Number, onlineText:String, isLive:true,
+//   offline:Boolean,   // ol<=0，仅供参考，**不要**拿它过滤房间
+//   loop:Boolean }     // rst===3，录像/重播角标
 ```
 
 约束：
 - 网络只能走 `src/services/net.js`（`$falcon.jsapi.http.request`，自定义头字段名是 `header` 单数，
   成功返回 `{result: body}`，非 2xx 返回 `{error:3, result:{errorMessage}}`）。
-- **不要**依赖 native form POST；GET 已验证可取流。
+  需要 POST 时用 `httpPost(url, opts)`：**只换 method，参数仍放 URL query，绝不给 body**
+  （见 §1 的告警框）。
 - md5 直接用 `src/services/md5.js`（v2.0.0 起从 `services/bili/md5.js` 迁出）。
 - 每个函数必须 catch，返回 `{ok:false, error, errorText}` 或空数组，绝不 throw 到页面。
 - 不写 console.log 噪声；用 `storage.js` 的 `logWarn`。

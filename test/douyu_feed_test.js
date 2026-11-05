@@ -12,7 +12,8 @@
 //   * storage 用不到（没有 $falcon.jsapi.storage）→ ensureDid() 会走「生成 + 内存」分支，
 //     正好顺带验证「storage 不可用时仍能取流」。
 //
-// 只读 + 只发 GET，不写任何远端状态。
+// 只读，不写任何远端状态。列表/分类/搜索走 GET，**取流 getH5PlayV1 必须走 POST**
+// （GET 只有 17.5% 成功率，其余被服务端糊成 -15「非法请求」，见 douyu/api.js 文件头 A）。
 const assert = require('assert');
 
 // ---- $falcon 同构 shim：把 jsapi.http.request 映射到 fetch ----
@@ -99,7 +100,7 @@ async function main() {
   check('取流 URL 含 ver=Douyu_224011102', playUrl.indexOf('ver=Douyu_224011102') > 0);
   check('取流 URL 含 iar=0', playUrl.indexOf('iar=0') > 0);
   check('取流 URL 含 rate=', playUrl.indexOf('rate=2') > 0);
-  line('  取流 URL 长度（enc_data 696 字符时）：' + playUrl.length + ' 字符 —— 远低于 2000，GET 可行');
+  line('  取流 URL 长度（enc_data 696 字符时）：' + playUrl.length + ' 字符 —— 远低于 2000（POST 的 query 同样走 URL）');
 
   // normalize 的图片档位
   const rawRoom = {
@@ -240,17 +241,22 @@ async function main() {
       check('换档可单独签名成功', info2.ok === true, info2.errorText || '');
       check('两档直链不同（各自签名）', !info2.ok || info2.url !== info.url);
     }
-    // 未开播/不存在 → -15（错误语义必须与成功区分开）
+    // 房间不存在 → -3（改 POST 后服务端的错误码变精细了：
+    //   -3 不存在 / -4 封禁 / -5 未开播 / -15 是 GET 时代的万能码）
     const bogus = await api.fetchPlayInfo(999999999, 2);
     line('  不存在的房间 → ok=' + bogus.ok + ' error=' + bogus.error + ' text=' + bogus.errorText);
     check('不存在房间返回 ok:false 且不 throw', bogus.ok === false);
-    check('不存在房间错误码为 -15', Number(bogus.error) === -15, String(bogus.error));
+    check('不存在房间错误码为 -3', Number(bogus.error) === -3, String(bogus.error));
     check('非法 rid 被本地拦下', (await api.fetchPlayInfo(0, 2)).ok === false);
   }
 
   // ---------- 7. 错误语义 ----------
   hr('7. 错误语义');
-  check('describeDouyuError -15', api.describeDouyuError(-15, '非法请求').indexOf('未开播') > 0);
+  check('describeDouyuError -3 房间不存在', api.describeDouyuError(-3, '房间不存在').indexOf('不存在') > 0);
+  check('describeDouyuError -5 未开播', api.describeDouyuError(-5, '').indexOf('未开播') > 0);
+  check('describeDouyuError -4 封禁', api.describeDouyuError(-4, '').indexOf('封禁') > 0);
+  // -15 是 GET 时代的万能码，POST 后基本见不到，但保留识别做兜底
+  check('describeDouyuError -15 兜底', api.describeDouyuError(-15, '非法请求').indexOf('不存在') > 0);
   check('describeDouyuError -9 提示校时', api.describeDouyuError(-9, '时间戳错误').indexOf('时钟') > 0);
   check('describeDouyuError 1000 提示 did', api.describeDouyuError(1000, '').indexOf('did') >= 0);
 

@@ -17,9 +17,11 @@
 //      实测「王者」→ cateResult 命中 181(王者荣耀,435 间)，181 首页 120 条里标题/主播含"王者"的 10 条。
 //    → 过滤后为空（关键词是分类名但没人写进标题，如「三角洲行动」）→ 返回该分类全部，标 via:'cate'。
 //
-// 3) 未开播判定：rl[].ol=0 → 取流必得 error=-15（257 间抽样 13 间 ol=0，全部 -15）。
-//    默认 hideOffline=true 把这类房间剔掉，避免网格里出现点进去必然失败的格子；
-//    需要原始列表时传 {hideOffline:false}。
+// 3) 不做任何「未开播」过滤。历史上的 hideOffline（按 rl[].ol<=0 剔房间）已删除：
+//    * 实测 ol=0 的房间里也有人能正常取流（人气是延迟统计，不是开播状态）；
+//    * 真正的根因在取流用了 GET（见 api.js 文件头 A）：83% 的房间被服务端拒成 -15，
+//      看起来全都像未开播。改用 POST 后 240/240 全部可取流。
+//    → 列表照原样返回，谁没在播由取流结果说话。
 import { logWarn } from '../storage.js';
 import { douyuGetJson, DOUYU_HOST } from './api.js';
 import { MIX_CID1, fetchCateByKeyword, fetchCategories } from './cate.js';
@@ -53,16 +55,16 @@ export function buildMixListUrl(cid2, page) {
  * 拉一页房间。返回 { ok, items, page, total, error?, errorText? }，不 throw。
  *
  * `total` = 服务端 pgcnt（**总页数**，不是总条数；推荐实测 62）。
+ * 不做未开播过滤（见文件头 3）。
  * @param {number} cid2 0/空 = 推荐
  * @param {number} [page]
- * @param {{hideOffline?: boolean, size?: 'rs16'|'rs1'}} [opts]
+ * @param {{size?: 'rs16'|'rs1'}} [opts]
  * @returns {Promise<{ok:boolean, items:Array, page:number, total:number, error?:*, errorText?:string}>}
  */
 export async function fetchLiveList(cid2, page, opts) {
   const o = opts || {};
   const c = Math.floor(Number(cid2) || 0);
   const p = Math.max(1, Math.floor(Number(page) || 1));
-  const hideOffline = o.hideOffline !== false; // 默认剔除未开播
 
   const url = buildMixListUrl(c, p);
   const r = await douyuGetJson(url, { tag: 'mixList ' + (c > 0 ? '2_' + c : RCMD_SEGMENT) + '/' + p });
@@ -80,8 +82,7 @@ export async function fetchLiveList(cid2, page, opts) {
     return { ok: false, items: [], page: p, total: 0, error: 'BAD_SHAPE', errorText: '列表数据缺失' };
   }
   const rl = Array.isArray(d.rl) ? d.rl : [];
-  let items = normalizeRoomList(rl, { size: o.size });
-  if (hideOffline) items = items.filter((x) => !x.offline);
+  const items = normalizeRoomList(rl, { size: o.size });
 
   let total = Number(d.pgcnt) || 0;
   if (total > MAX_PAGES) total = MAX_PAGES;
@@ -107,7 +108,7 @@ export function matchKeyword(item, kw) {
  *   via='cate'   关键词命中了分类，但该分类房间里没人把关键词写进标题/主播名
  *                → 返回该分类**全部**房间（用户意图多半就是想看这个分类）
  * @param {string} keyword
- * @param {{limit?: number, hideOffline?: boolean, size?: 'rs16'|'rs1'}} [opts]
+ * @param {{limit?: number, size?: 'rs16'|'rs1'}} [opts]
  * @returns {Promise<{ok:boolean, items:Array, via:string, error?:*, errorText?:string}>}
  */
 export async function searchLive(keyword, opts) {
@@ -115,14 +116,13 @@ export async function searchLive(keyword, opts) {
   const kw = typeof keyword === 'string' ? keyword.trim() : '';
   if (!kw) return { ok: true, items: [], via: 'direct' };
   const limit = Number(o.limit) > 0 ? Math.floor(Number(o.limit)) : PAGE_SIZE;
-  const hideOffline = o.hideOffline !== false;
 
   // 1) 关键词 → 候选分类
   const cates = await fetchCateByKeyword(kw);
   if (!cates.length) {
     logWarn('[douyu] 搜索无候选分类: ' + kw);
     // 无候选分类 → 退化为在推荐流里过滤（覆盖「关键词直接出现在标题里但没对应分类」的情况）
-    const r = await fetchLiveList(0, 1, { hideOffline: hideOffline, size: o.size });
+    const r = await fetchLiveList(0, 1, { size: o.size });
     if (!r.ok) return { ok: false, items: [], via: 'direct', error: r.error, errorText: r.errorText };
     const hit = r.items.filter((x) => matchKeyword(x, kw)).slice(0, limit);
     return { ok: true, items: hit, via: 'direct' };
@@ -134,7 +134,7 @@ export async function searchLive(keyword, opts) {
   let lastErr = null;
   for (let i = 0; i < tried; i++) {
     const c = cates[i];
-    const r = await fetchLiveList(c.cid2, 1, { hideOffline: hideOffline, size: o.size });
+    const r = await fetchLiveList(c.cid2, 1, { size: o.size });
     if (!r.ok) {
       lastErr = r;
       continue;

@@ -33,6 +33,18 @@ export const GRID_COLS = 5;
 
 // 把条目列表裁到列数的整数倍（尾部余数丢掉），并报告是否发生了裁剪。
 // 只裁尾部、不重排，保证已有卡片位置不变。
+/* 给「条目可能很少」的场景用的安全版：够一行以上才裁末行，
+ * 否则原样返回。浏览分区（实测有只挂 1~3 间房的小分类）和搜索结果
+ * （斗鱼「标题直接命中」常常只有 1~2 间）都必须走这个，
+ * 直接 trimToGridRows 会把整页裁成空白 —— 界面显示「没有搜到」但实际有结果。
+ * trimToGridRows 本身保持原语义，单测仍覆盖它的纯裁行行为。 */
+export function trimGridSafe(items, cols) {
+  const list = Array.isArray(items) ? items : [];
+  const n = Math.max(1, Math.round(Number(cols) || GRID_COLS));
+  if (list.length <= n) return { items: list, trimmed: 0 };
+  return trimToGridRows(list, n);
+}
+
 export function trimToGridRows(items, cols) {
   const list = Array.isArray(items) ? items : [];
   const n = Math.max(1, Math.round(Number(cols) || GRID_COLS));

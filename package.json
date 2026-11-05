@@ -2,7 +2,7 @@
   "name": "douyu-app",
   "appName": "PenDouyu",
   "appid": "8002026110200002",
-  "version": "2.0.0",
+  "version": "2.1.0",
   "icon": "app_icon.png",
   "description": "PenDouyu（有道 X6 Pro）：纯斗鱼直播客户端 —— 分类浏览、搜索、多码率切换，curl 命名管道拉流 + MPP 硬解 + KMS 直出，蓝牙耳机音量镜像",
   "quickjs": {

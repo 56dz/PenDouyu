@@ -85,7 +85,7 @@ export function normalizeAvatar(av, size) {
 }
 
 /**
- * 人气数 → "536.1万" / "1.2亿"；非正数 → ''（列表里 ol=0 表示未开播）。
+ * 人气数 → "536.1万" / "1.2亿"；非正数 → ''（ol 只是热度统计，ol=0 不代表未开播）。
  * @param {number} n
  * @returns {string}
  */
@@ -107,10 +107,24 @@ function cleanText(s) {
  * rl[] 原始条目 → 统一 item。
  * 统一结构见 docs/douyu-integration.md §2（browse 网格直接消费）。
  *
- * 关于 isLive：契约写的是 `isLive:true`，这里**照契约恒为 true**（斗鱼列表本来就是直播列表），
- * 另外附 `offline` 布尔。依据：实测 rl[] 里 ol=0 的房间取流会返回 error=-15「非法请求」
- * （257 个房间抽样 13 个 ol=0，全部 -15）→ ol=0 等价于未开播，UI 可据此置灰/过滤，
- * 由 feed.js 决定是否剔除（默认剔除，避免点进去必然失败）。
+ * 关于 isLive：契约写的是 `isLive:true`，这里**照契约恒为 true**（斗鱼列表本来就是直播列表）。
+ * 另外附两个附加字段（契约外，供 UI 使用）：
+ *   `offline` = ol<=0         **仅供参考，不要拿它过滤房间**
+ *   `loop`    = rst === 3     录像/重播，零额外请求（rst 是 rl[] 自带字段）
+ *
+ * ⚠️ 早期版本的注释断言「ol=0 等价于未开播」——**已证伪**：
+ *   * 实测 ol=0 的房间里也有能正常取流开播的（人气字段本身是延迟统计，不是开播状态）；
+ *   * 更关键的是取流曾用 GET，83% 的房间被服务端当成 -15「非法请求」拒掉，
+ *     看起来全都像「未开播」。改用 POST 后 240/240 全部成功。
+ *   → 所以 feed.js 不再按 offline 剔房间，UI 也不应该据此置灰。
+ *   真正要判「没在播」只能看取流是否返回 -15。
+ *
+ * loop（重播/录像）判据 `rst === 3`，同样零额外请求（rst 就是 rl[] 自带字段）。
+ * 实测：推荐页第 1 页全部 120 间房全量交叉验证，真值取 getRoomLoopInfo 的
+ * `loopType > 0 && vid !== ''` → **TP=9 FP=0 FN=0 TN=111，零误判**。
+ * ⚠️ 不要改用 isShowLoopLogo === 1 当判据：它身上有 3 个房间返回 0，
+ *    但那 3 间**确实是重播**（loopType=3005、vid 有效，只是没展示 logo 角标），
+ *    用它会得到 FP=3（我一开始就踩了这个坑）。
  *
  * @param {object} raw
  * @param {{size?: 'rs16'|'rs1'}} [opts]
@@ -134,8 +148,9 @@ export function normalizeRoom(raw, opts) {
     online: online,
     onlineText: formatOnline(online),
     isLive: true,
-    // 附加字段（契约外，供 UI 置灰/过滤）
-    offline: online <= 0,
+    // 附加字段（契约外）
+    offline: online <= 0, // 仅供参考，**不要**用来过滤（见上方注释）
+    loop: raw.rst === 3, // 重播/录像角标（严格相等：实测 rst 是数字 3，字符串不算）
     cid2: Number(raw.cid2) || 0
   };
 }

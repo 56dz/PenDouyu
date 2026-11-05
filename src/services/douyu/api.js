@@ -4,17 +4,28 @@
 // 本文件在 doc 基础上补充的实测结论（2026-11-04，本机 node fetch，同 UA/Referer）：
 //
 //   A. 取流 URL 长度：enc_data 实测 696 字符，encodeURIComponent 后整条 getH5PlayV1
-//      URL 约 **900 字符**（远低于 2000）→ 继续用 GET，不需要退回 native POST。
-//      仍保留长度告警（见 PLAY_URL_SOFT_LIMIT），日后 enc_data 变长能第一时间发现。
+//      URL 约 **900 字符**（远低于 2000）→ 不需要为长度操心。
+//      **但 HTTP 方法必须是 POST**（2026-11 实测，240 间房）：
+//        GET  成功 42/240（17.5%），POST 成功 240/240（100%）；
+//        再用 POST-first 顺序复测 30 间排除时序/限流混淆 → POST 30/30、GET 12/30。
+//      GET 失败时服务端返回的仍是 HTTP 200 + error:-15「非法请求」，与「房间不存在」
+//      长得一模一样 → 改 POST 之前，那 83% 的「未开播」全是我方误判。
+//      参数仍旧全放 URL query、body 留空即可（实测 20/20 成功），
+//      所以不需要走 native 的 form POST（那个能给 body，但没必要）。
 //   B. getEncryption 的 expire_at 实测 = now + 601s，enc_time 实测恒为 1（循环 1 次）。
 //      f（派生密钥）只在 key/rand_str 变化时失效 → 按 expire_at 缓存，多码率切换复用，
 //      **每次仍单独签名请求**（doc 要求，改 URL 后缀会 403）。
 //   C. 错误语义实测（与 net.js 的两段式不同，必须分开判定）：
 //        HTTP 403（net.js 报 error:3 / resCode:403） → auth 或 did 不一致（签名被拒）
-//        HTTP 200 + error:-15 + msg「非法请求」      → 房间不存在**或未开播**（ol=0 必得 -15）
+//        HTTP 200 + error:-3                         → 房间不存在
+//        HTTP 200 + error:-4                         → 房间被封禁
+//        HTTP 200 + error:-5                         → 房间未开播（**真正的「未开播」**）
+//        HTTP 200 + error:-15                        → GET 时代的万能错误码，POST 后基本见不到
 //        HTTP 200 + error:-9  + msg「时间戳错误」    → 设备时钟偏差（ts 秒级必须准）
 //        HTTP 200 + error:1000                       → did 为空
 //        HTTP 200 + error:0                          → data.rtmp_url + '/' + data.rtmp_live
+//      注：-3/-4/-5 这一层精细区分是**改 POST 之后才得到的**。GET 时代服务端把所有
+//      失败统一糊成 -15「非法请求」，所以那时「未开播」在客户端根本无从判断。
 //   D. rate 请求**不保证被遵守**：同一房间不同时刻实测出现过
 //        rate=0 → 返回 4 / rate=4 → 返回 0（原画）/ rate=4 → 返回 4
 //      即服务端按房间实际可用档位就近取，同一请求参数结果可能不同。
@@ -22,7 +33,7 @@
 //        想稳定要某档应校验返回的 rate 并在不匹配时重取。
 //
 // 约束（doc §2）：所有函数 catch，绝不 throw；日志走 storage.js 的 logWarn。
-import { httpGet, tryParseJson } from '../net.js';
+import { httpGet, httpPost, tryParseJson } from '../net.js';
 import { logWarn, getString, setString, memoryPeek } from '../storage.js';
 import { md5Hex } from '../md5.js';
 
@@ -57,20 +68,25 @@ export function douyuHeaders(extra) {
 }
 
 /**
- * 斗鱼 GET JSON。返回 { ok, data, error, errorText, statusCode }，**不 throw**。
+ * 斗鱼 JSON 请求。返回 { ok, data, error, errorText, statusCode }，**不 throw**。
  *
  * 注意 net.js 的语义：非 2xx 时 body 不可得，只能拿到 'curl ... resCode:N' 文本，
  * 所以这里把 statusCode 非 2xx 单独归一成 NET 错误，交给调用方按码分支。
  *
+ * `opts.method` 默认 'GET'；只有取流（getH5PlayV1）需要传 'POST'，原因见 fetchPlayInfo。
+ * POST 也不发请求体 —— 参数依旧全部在 URL query 上（net.js 的 httpRequest 刻意不带 data）。
+ *
  * @param {string} url 绝对 URL（调用方负责拼 query）
- * @param {{timeout?: number, tag?: string}} [opts]
+ * @param {{timeout?: number, tag?: string, method?: string}} [opts]
  */
 export async function douyuGetJson(url, opts) {
   const o = opts || {};
   const tag = o.tag || 'douyu';
+  const method = typeof o.method === 'string' ? o.method.toUpperCase() : 'GET';
   let res;
   try {
-    res = await httpGet(url, { headers: douyuHeaders(), timeout: o.timeout || 15000 });
+    const send = method === 'POST' ? httpPost : httpGet;
+    res = await send(url, { headers: douyuHeaders(), timeout: o.timeout || 15000 });
   } catch (e) {
     const msg = (e && e.message) || String(e);
     logWarn('[douyu] ' + tag + ' 传输失败: ' + msg);
@@ -99,12 +115,28 @@ export async function douyuGetJson(url, opts) {
 }
 
 // 斗鱼业务码 → 人话（探针实测到的都收了；未收录的码原样带出）
+//
+// ⚠️ 取流从 GET 改成 POST 之后，错误码**变精细了**（实测于 2026-11）：
+//    GET 时代所有失败都被糊成 -15「非法请求」，与「房间不存在」无法区分；
+//    POST 之后服务端给出真正的成因：
+//      -3 房间不存在（rid=1/3/12345/999999999 实测）
+//      -4 房间被封禁（rid=2 实测）
+//      -5 房间未开播（rid=99 实测，这才是真正的「未开播」）
+//      -9 时间戳错误（设备时钟偏差）
+//    -15 仍保留识别（老版本/异常路径还可能吐它），但已不再是主力。
 export function describeDouyuError(code, msg) {
   const m = typeof msg === 'string' ? msg : '';
   switch (code) {
+    case -3:
+      return '房间不存在(-3)';
+    case -4:
+      return '房间被封禁(-4)';
+    case -5:
+      return '主播未开播(-5)';
     case -15:
-      // 房间不存在或未开播，两者服务端不区分
-      return '房间不存在或未开播(-15)';
+      // GET 时代的「万能错误码」：取流用 GET 时有 83% 的正常房间被它拒掉。
+      // 现在走 POST 基本见不到，保留识别只为兜底（语义按「房间不存在/不可播」）。
+      return '房间不存在(-15)';
     case -9:
       return '时间戳错误(-9)：设备时钟不准，请校对时间';
     case -1:
@@ -341,13 +373,16 @@ export async function fetchPlayInfo(rid, rate) {
   const ts = Math.floor(Date.now() / 1000);
   const url = buildPlayUrl(id, wantRate, { did: did, enc_data: enc.enc_data, key: enc.key, f: enc.f }, ts);
   if (url.length > PLAY_URL_SOFT_LIMIT) {
-    // 实测 900 字符；超限说明 enc_data 变长，需重新评估是否必须改 POST（doc §4 的 native 路线）
+    // 实测 900 字符；超限说明 enc_data 变长，值得看一眼（POST 不改 URL 长度上限问题）
     logWarn('[douyu] 取流 URL 过长(' + url.length + ')，可能超出设备 http 上限');
   }
 
   let r;
   try {
-    r = await douyuGetJson(url, { tag: 'getH5PlayV1/' + id });
+    // **必须 POST**：GET 只有 17.5% 成功率，其余会被服务端当成 -15「非法请求」，
+    // 看起来就像房间不存在 —— 这是「主页大量房间未开播」的真正根因。
+    // POST 同样把参数全放 query、body 留空（net.js 的 httpRequest 不发 body）。
+    r = await douyuGetJson(url, { tag: 'getH5PlayV1/' + id, method: 'POST' });
   } catch (e) {
     // douyuGetJson 本身不 throw，这里是双保险
     return { ok: false, rid: id, error: 'NETWORK', errorText: (e && e.message) || '网络错误' };
